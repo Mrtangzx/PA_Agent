@@ -454,6 +454,7 @@ PA Agent 内置一套**二元决策树**（基于 `prompt_engineering/二元决�
 
 | 设置项              | 说明               | 默认值                           |
 | ---------------- | ---------------- | ----------------------------- |
+| 运行方式             | OpenAI 兼容 API / Codex SDK / Cursor SDK | OpenAI 兼容 API |
 | 模型 (model)       | AI 模型名称          | `claude-sonnet-4-6`           |
 | Base URL         | API 接口地址         | `https://www.packyapi.com/v1` |
 | API Key          | API 密钥（加密存储）     | 空                             |
@@ -472,6 +473,16 @@ PA Agent 内置一套**二元决策树**（基于 `prompt_engineering/二元决�
 | PackyAPI | `https://www.packyapi.com/v1` | `claude-sonnet-4-6` |
 | KKAI     | `https://api.kkone.vip/v1`    | —                   |
 | 云雾       | `https://api.yunwu.ai/v1`     | —                   |
+| Codex SDK | 无需填写（使用本机 Codex 登录） | `gpt-5.6-terra`     |
+
+**Codex SDK Agent 设置**：
+
+1. 先在 Codex 桌面端或 CLI 登录账号。
+2. 将「运行方式」选为 **Codex SDK（本地 Agent）**。
+3. 选择本机账号可用的 Codex 模型；默认使用 `gpt-5.6-terra`。
+4. Base URL 与 API Key 会禁用，不需要填写。
+
+Codex 分析运行在临时只读线程中，禁止工具调用和文件修改。阶段一、阶段二仍使用 PA Agent 原有 Prompt、JSON 校验与失败重试流程。
 
 
 ### 通用设置

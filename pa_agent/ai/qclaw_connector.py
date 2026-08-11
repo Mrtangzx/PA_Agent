@@ -273,6 +273,7 @@ def apply_qclaw_provider_to_settings(
         return "QClaw 配置读取失败。"
 
     provider = settings.provider
+    provider.backend = "openai_compatible"
     provider.model = resolved.model
     provider.base_url = resolved.base_url
     provider.api_key = resolved.api_key

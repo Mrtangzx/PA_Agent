@@ -12,7 +12,10 @@
    copy config\settings.example.json config\settings.json
    ```
 
-2. 启动程序，在 **设置** 中填写你的 **API Key**（会加密写入 `api_key_encrypted`）。
+2. 启动程序，在 **设置** 中选择 AI 运行方式：
+
+   - 使用 OpenAI 兼容 API 时填写 **API Key**；
+   - 使用 **Codex SDK（本地 Agent）** 时先登录本机 Codex，无需 Base URL 或 API Key。
 
    也可直接编辑 `config/settings.json` 中的 `base_url`、`model` 等字段，Key 仍建议通过 GUI 保存以便自动加密。
 
@@ -32,6 +35,7 @@
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
+| `provider.backend` | string | `"openai_compatible"` | AI 运行方式：`openai_compatible` / `cursor_sdk` / `codex_sdk`。Codex SDK 使用本机 Codex 登录状态，并以临时只读 Agent 线程执行分析 |
 | `provider.model` | string | `"deepseek-v4-flash"` | 模型名称（须与网关支持的名称一致） |
 | `provider.base_url` | string | `"https://api.deepseek.com"` | OpenAI 兼容 API 根地址。DeepSeek：`https://api.deepseek.com`；MiMo：`https://api.xiaomimimo.com/v1`（程序自动处理 `enable_thinking` 与 `reasoning_content` 回放） |
 | `provider.api_key` | string | `""` | API Key（明文，内存中临时使用；不持久化到文件） |
@@ -44,7 +48,7 @@
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `general.last_data_source` | string | `"mt5"` | K 线数据来源：`mt5` / `tradingview`（GUI 下拉选项）；`akshare` / `yfinance`（仅代码支持） |
+| `general.last_data_source` | string | `"mt5"` | K 线数据来源：`mt5` / `tradingview` / `eastmoney` / `eastmoney_futures`（GUI 下拉选项）；`akshare` / `yfinance`（仅代码支持） |
 | `general.last_tradingview_exchange` | string | `""` | TradingView 交易所。空字符串 =（自动）依次探测预设列表。如 `OANDA`、`SSE`、`HKEX` 等 |
 | `general.last_symbol` | string | `"XAUUSDm"` | 默认品种。MT5 需含后缀（如 `m`），TradingView 用标准名（如 `XAUUSD`） |
 | `general.last_timeframe` | string | `"15m"` | 默认周期，如 `1m`、`5m`、`15m`、`1h`、`4h`、`1d` |

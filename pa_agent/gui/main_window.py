@@ -422,10 +422,10 @@ class MainWindow(QMainWindow):
         ds_index = self._data_source_combo.findData(_last_ds)
         if ds_index >= 0:
             self._data_source_combo.setCurrentIndex(ds_index)
-        self._data_source_combo.setMinimumWidth(108)
+        self._data_source_combo.setMinimumWidth(156)
         self._data_source_combo.setToolTip(
             "K 线数据来源：MT5（需终端登录）、TradingView（tvDatafeed）、"
-            "本地仅支持 MT5 与 TradingView"
+            "A 股（东方财富）、国内期货（AkShare / 新浪行情，无需 MT5）"
         )
         self._data_source_combo.currentIndexChanged.connect(
             self._on_data_source_combo_changed
@@ -621,7 +621,8 @@ class MainWindow(QMainWindow):
         outer_layout.addLayout(ctrl_layout)
 
         self._api_key_alert_label = QLabel(
-            "未配置 API Key：请点击左上角「AI 模型」按钮，在设置中填写 API Key 后才能进行 AI 分析。"
+            "未配置可用的 AI 凭据：请点击左上角「AI 模型」，填写 API Key，"
+            "或选择使用本机登录状态的 Codex SDK。"
         )
         self._api_key_alert_label.setWordWrap(True)
         self._api_key_alert_label.setStyleSheet(
@@ -1006,14 +1007,20 @@ class MainWindow(QMainWindow):
 
     def _apply_gold_defaults_for_data_source(self, kind: str) -> None:
         """Reset symbol/exchange to defaults when switching data source."""
+        from pa_agent.data.factory import default_symbol_for_kind
         from pa_agent.data.market_defaults import (
             A_SHARE_DEFAULT_TIMEFRAME,
             normalize_gold_symbol_for_kind,
         )
 
-        sym = normalize_gold_symbol_for_kind(
-            kind, self._symbol_combo.currentText().strip()
-        )
+        if kind == "eastmoney_futures":
+            # This project is gold-first.  XAUUSD is not a valid domestic
+            # futures code, so switch to Shanghai gold main contract.
+            sym = default_symbol_for_kind(kind)
+        else:
+            sym = normalize_gold_symbol_for_kind(
+                kind, self._symbol_combo.currentText().strip()
+            )
         self._symbol_combo.blockSignals(True)
         self._symbol_combo.setCurrentText(sym)
         self._symbol_combo.blockSignals(False)
@@ -1262,7 +1269,7 @@ class MainWindow(QMainWindow):
             self._switch_data_source(kind)
 
     def _on_data_source_combo_changed(self, index: int) -> None:
-        """Switch K-line data source (MT5 / TradingView)."""
+        """Switch the active K-line data source."""
         if getattr(self, "_switching", False):
             return
         if getattr(self, "_demo_mode", False):
@@ -4127,7 +4134,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def showEvent(self, event: QShowEvent | None) -> None:
-        """On first show, prompt for API Key when missing."""
+        """On first show, prompt for AI credentials when missing."""
         super().showEvent(event)
         if self._startup_api_key_check_done:
             return
@@ -4146,9 +4153,9 @@ class MainWindow(QMainWindow):
         if not self._has_api_key_configured():
             QMessageBox.information(
                 self,
-                "需要配置 API Key",
-                "尚未配置 API Key，将打开设置窗口。\n"
-                "请填写 API Key 并点击「保存」，才能使用「提交分析」与「增量分析」。",
+                "需要配置 AI 提供商",
+                "尚未配置可用的 AI 凭据，将打开设置窗口。\n"
+                "可以填写 API Key，或选择 Codex SDK 使用本机 Codex 登录状态。",
             )
             self._open_settings_dialog(focus_api_key=True)
 
@@ -4159,7 +4166,7 @@ class MainWindow(QMainWindow):
         return provider_api_key_configured(settings)
 
     def _refresh_api_key_ui_state(self) -> None:
-        """Show or hide API Key warning and sync submit button state."""
+        """Show or hide AI credential warning and sync submit button state."""
         configured = self._has_api_key_configured()
         alert = getattr(self, "_api_key_alert_label", None)
         if alert is not None:
@@ -4171,9 +4178,9 @@ class MainWindow(QMainWindow):
         if self._analysis_in_progress:
             return
         cur = status_bar.currentMessage() or ""
-        if cur in ("就绪", "") or "API Key" in cur or "提交分析已锁定" in cur:
+        if cur in ("就绪", "") or "API Key" in cur or "AI 凭据" in cur or "提交分析已锁定" in cur:
             status_bar.showMessage(
-                "未配置 API Key：请点击左上角「AI 模型」填写后才能分析"
+                "未配置 AI 凭据：请填写 API Key，或选择 Codex SDK"
             )
 
     def _open_settings_dialog(self, *, focus_api_key: bool = False) -> None:
@@ -4255,7 +4262,13 @@ class MainWindow(QMainWindow):
             return
         p = settings.provider
         base = (p.base_url or "").lower()
-        if "deepseek.com" in base:
+        if getattr(p, "backend", "openai_compatible") == "codex_sdk":
+            thinking = "开" if p.thinking else "关"
+            effort = p.reasoning_effort if p.thinking else "none"
+            self._ai_mode_label.setText(
+                f"Codex Agent · {p.model} · 思考={thinking} · effort={effort} · 只读"
+            )
+        elif "deepseek.com" in base:
             thinking = "开" if p.thinking else "关"
             self._ai_mode_label.setText(
                 f"思考: {thinking} · effort={p.reasoning_effort} · {p.model}"
@@ -4294,7 +4307,7 @@ class MainWindow(QMainWindow):
     def _submit_block_reason(self) -> str | None:
         """Human-readable reason when submit is disabled, or None if allowed."""
         if not self._has_api_key_configured():
-            return "未配置 API Key，请点击左上角「AI 模型」填写后才能分析"
+            return "未配置 AI 凭据，请填写 API Key，或选择 Codex SDK"
         if self._demo_mode:
             return "演示模式中，请退出演示后再提交真实分析"
         if self._analysis_in_progress:

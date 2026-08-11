@@ -76,6 +76,7 @@ def apply_cursor_provider_to_settings(
     """
     model_hint = (preferred_model or getattr(settings.provider, "model", "") or "").strip()
     provider = settings.provider
+    provider.backend = "cursor_sdk"
     # Preserve whatever the user typed as the alias (openclaw_cs or openclaw_cs/<id>)
     provider.model = model_hint or _CURSOR_MODEL
     # Cursor SDK doesn't use base_url; clear it to avoid implying an OpenAI endpoint.

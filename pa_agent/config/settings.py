@@ -7,12 +7,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
 DataSourceKind = Literal["mt5", "tradingview", "akshare", "eastmoney", "eastmoney_futures", "tushare"]
 NormalizationMode = Literal["strict", "lenient"]
+AIBackend = Literal["openai_compatible", "cursor_sdk", "codex_sdk"]
 
 
 class AIProviderSettings(BaseModel):
     """AI provider connection and behaviour settings."""
     model_config = ConfigDict(extra="ignore")
 
+    backend: AIBackend = "openai_compatible"
     model: str = "deepseek-v4-flash"
     base_url: str = "https://api.deepseek.com"
     api_key: str = ""
@@ -168,9 +170,15 @@ class Settings(BaseModel):
 
 
 def provider_api_key_configured(settings: Settings | None) -> bool:
-    """Return True when a non-empty API key is loaded in memory."""
+    """Return True when the selected AI backend has usable credentials.
+
+    Codex SDK authenticates through the local Codex account, so it does not
+    require an API key in PA Agent's settings.
+    """
     if settings is None:
         return False
+    if settings.provider.backend == "codex_sdk":
+        return True
     return bool((settings.provider.api_key or "").strip())
 
 

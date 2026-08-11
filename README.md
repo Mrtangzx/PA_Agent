@@ -70,6 +70,17 @@ make uv-run
 
 > 运行测试：`make uv-test`，代码检查：`make uv-lint`。
 
+### 使用 Codex SDK Agent 分析
+
+PA Agent 可通过官方 Python Codex SDK，把阶段一市场诊断、阶段二交易决策和分析后追问交给本机 Codex Agent：
+
+1. 先在 Codex 桌面端或 CLI 登录账号。
+2. 打开 PA Agent 左上角 **AI 模型**。
+3. 将 **运行方式** 选为 **Codex SDK（本地 Agent）**。
+4. 模型填写 Codex 可用模型（默认 `gpt-5.6-terra`），无需填写 Base URL 或 API Key。
+
+每次分析使用临时 Codex 线程，并强制采用只读沙箱、拒绝审批和禁止工具指令；Agent 只处理 PA Agent 传入的 K 线与分析 Prompt，不修改项目文件。依赖包为 `openai-codex`，随包提供匹配的本地 Codex CLI 运行时。
+
 ---
 
 ## 详细说明

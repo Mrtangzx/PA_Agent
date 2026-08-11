@@ -559,6 +559,7 @@ def apply_workbuddy_provider_to_settings(
         )
 
     provider = settings.provider
+    provider.backend = "openai_compatible"
     provider.model = resolved.model
     provider.base_url = resolved.base_url
     provider.api_key = resolved.api_key

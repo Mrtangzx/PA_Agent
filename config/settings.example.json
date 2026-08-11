@@ -1,5 +1,6 @@
 {
   "provider": {
+    "backend": "openai_compatible",
     "model": "deepseek-chat",
     "base_url": "https://api.deepseek.com",
     "api_key_encrypted": "",

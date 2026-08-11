@@ -1,7 +1,9 @@
 """Tests for AI client factory routing."""
+
 from __future__ import annotations
 
 from pa_agent.ai.client_factory import create_ai_client
+from pa_agent.ai.codex_sdk_client import CodexSdkClient
 from pa_agent.ai.cursor_sdk_client import CursorSdkClient
 from pa_agent.ai.deepseek_client import DeepSeekClient
 from pa_agent.config.settings import AIProviderSettings
@@ -25,3 +27,24 @@ def test_create_ai_client_openclaw_uses_deepseek_client() -> None:
     )
     client = create_ai_client(settings)
     assert isinstance(client, DeepSeekClient)
+
+
+def test_create_ai_client_codex_backend_uses_codex_sdk() -> None:
+    settings = AIProviderSettings(
+        backend="codex_sdk",
+        model="gpt-5.6-terra",
+        base_url="",
+        api_key="",
+    )
+    client = create_ai_client(settings)
+    assert isinstance(client, CodexSdkClient)
+
+
+def test_explicit_codex_backend_wins_over_legacy_cursor_alias() -> None:
+    settings = AIProviderSettings(
+        backend="codex_sdk",
+        model="openclaw_cs",
+        api_key="",
+    )
+    client = create_ai_client(settings)
+    assert isinstance(client, CodexSdkClient)

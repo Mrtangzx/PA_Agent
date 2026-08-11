@@ -61,6 +61,13 @@ class AIModelSettingsDialog(QDialog):
         provider_group = QGroupBox("AI 提供商")
         form = QFormLayout(provider_group)
 
+        self._backend_combo = QComboBox()
+        self._backend_combo.addItem("OpenAI 兼容 API", "openai_compatible")
+        self._backend_combo.addItem("Codex SDK（本地 Agent）", "codex_sdk")
+        self._backend_combo.addItem("Cursor SDK", "cursor_sdk")
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        form.addRow("运行方式:", self._backend_combo)
+
         self._model_edit = QLineEdit()
         form.addRow("模型 (model):", self._model_edit)
 
@@ -123,6 +130,15 @@ class AIModelSettingsDialog(QDialog):
         self._base_url_edit.setText(p.base_url)
         self._api_key_edit.setText(p.api_key)
         self._thinking_check.setChecked(p.thinking)
+        backend = getattr(p, "backend", "openai_compatible")
+        if backend == "openai_compatible" and is_openclaw_cs_model(p.model):
+            backend = "cursor_sdk"
+        backend_idx = self._backend_combo.findData(backend)
+        if backend_idx >= 0:
+            self._backend_combo.blockSignals(True)
+            self._backend_combo.setCurrentIndex(backend_idx)
+            self._backend_combo.blockSignals(False)
+        self._on_backend_changed()
         idx = self._reasoning_effort_combo.findText(p.reasoning_effort)
         if idx >= 0:
             self._reasoning_effort_combo.setCurrentIndex(idx)
@@ -132,9 +148,22 @@ class AIModelSettingsDialog(QDialog):
         model = self._model_edit.text().strip()
         base_url = self._base_url_edit.text().strip()
         api_key = self._api_key_edit.text().strip()
+        backend = str(self._backend_combo.currentData() or "openai_compatible")
 
         # Explicit model aliases win over stale base_url (openclaw_wb before openclaw).
-        if is_openclaw_wb_model(model) or should_use_workbuddy_provider(model, base_url):
+        if backend == "codex_sdk":
+            p.backend = "codex_sdk"
+            p.model = model or "gpt-5.6-terra"
+            p.base_url = ""
+        elif backend == "cursor_sdk":
+            p.backend = "cursor_sdk"
+            p.api_key = api_key
+            err = self._apply_cursor_provider(preferred_model=model or "openclaw_cs")
+            if err:
+                QMessageBox.warning(self, "Cursor 配置异常", err)
+                return
+        elif is_openclaw_wb_model(model) or should_use_workbuddy_provider(model, base_url):
+            p.backend = "openai_compatible"
             p.api_key = api_key
             err = self._apply_workbuddy_provider(preferred_model=model)
             if err:
@@ -148,12 +177,14 @@ class AIModelSettingsDialog(QDialog):
                 QMessageBox.warning(self, "Cursor 配置异常", err)
                 return
         elif is_openclaw_model(model) or should_use_qclaw_provider(model, base_url):
+            p.backend = "openai_compatible"
             p.api_key = api_key
             err = self._apply_qclaw_provider(preferred_model=model)
             if err:
                 QMessageBox.warning(self, "QClaw 配置异常", err)
                 return
         else:
+            p.backend = "openai_compatible"
             field_err = self._validate_provider_fields(model, base_url)
             if field_err:
                 QMessageBox.warning(self, "AI 提供商配置有误", field_err)
@@ -171,8 +202,39 @@ class AIModelSettingsDialog(QDialog):
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
     def focus_api_key_field(self) -> None:
+        if not self._api_key_edit.isEnabled():
+            self._model_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+            self._model_edit.selectAll()
+            return
         self._api_key_edit.setFocus(Qt.FocusReason.OtherFocusReason)
         self._api_key_edit.selectAll()
+
+    def _on_backend_changed(self) -> None:
+        backend = str(self._backend_combo.currentData() or "openai_compatible")
+        is_codex = backend == "codex_sdk"
+        is_cursor = backend == "cursor_sdk"
+        self._base_url_edit.setEnabled(not (is_codex or is_cursor))
+        self._api_key_edit.setEnabled(not is_codex)
+        self._show_key_btn.setEnabled(not is_codex)
+
+        if is_codex:
+            if not self._model_edit.text().strip().lower().startswith("gpt-"):
+                self._model_edit.setText("gpt-5.6-terra")
+            self._base_url_edit.setPlaceholderText("Codex SDK 不使用 Base URL")
+            self._api_key_edit.setPlaceholderText("使用本机 Codex 登录状态，无需 API Key")
+            self._backend_combo.setToolTip(
+                "通过官方 openai-codex SDK 启动本地只读 Agent；使用本机 Codex 登录状态。"
+            )
+        elif is_cursor:
+            if not is_openclaw_cs_model(self._model_edit.text()):
+                self._model_edit.setText("openclaw_cs")
+            self._base_url_edit.setPlaceholderText("Cursor SDK 不使用 Base URL")
+            self._api_key_edit.setPlaceholderText("输入 Cursor API Key（crsr_...）")
+            self._backend_combo.setToolTip("")
+        else:
+            self._base_url_edit.setPlaceholderText("")
+            self._api_key_edit.setPlaceholderText("输入 API Key")
+            self._backend_combo.setToolTip("")
 
     def _toggle_api_key_visibility(self, checked: bool) -> None:
         if checked:
