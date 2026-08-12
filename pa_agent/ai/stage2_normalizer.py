@@ -1577,11 +1577,8 @@ def normalize_stage2(
             "breakout entry_price adjusted to basis extreme ± 1 tick (basis=%s)",
             decision.get("entry_basis_bar"),
         )
-    if isinstance(decision, dict):
-        from pa_agent.util.trade_metrics import adjust_decision_stop_for_tp1_rr_cap
-
-        if adjust_decision_stop_for_tp1_rr_cap(decision, kline_frame=kline_frame):
-            logger.debug("stop_loss widened to bring TP1 RR within program cap")
+    # Structural stops are immutable. RR validation may reject a plan, but must
+    # never widen the stop to make the metric pass.
     _coerce_decision_when_trade_metrics_fail(
         out,
         decision_stance=decision_stance,

@@ -80,8 +80,8 @@ def format_estimated_win_rate_reasoning(decision: dict[str, Any]) -> str:
 
 # Lower cap: reward must be at least equal to risk (1:1) for any stance.
 MIN_RISK_REWARD_RATIO = 1.0
-# Upper cap on TP1 reward:risk — enforced by widening stop, not by shrinking TP1.
-MAX_TP1_RISK_REWARD_RATIO = 1.0
+# Kept only as a source-compatibility symbol. There is no active RR upper cap.
+MAX_TP1_RISK_REWARD_RATIO = float("inf")
 
 
 def min_risk_reward_ratio(decision_stance: str | None = None) -> float:
@@ -91,8 +91,8 @@ def min_risk_reward_ratio(decision_stance: str | None = None) -> float:
 
 
 def max_risk_reward_ratio() -> float | None:
-    """Maximum TP1 reward:risk after program stop adjustment."""
-    return MAX_TP1_RISK_REWARD_RATIO
+    """There is intentionally no maximum reward:risk ratio."""
+    return None
 
 
 def widen_stop_for_tp1_rr_cap(
@@ -103,95 +103,9 @@ def widen_stop_for_tp1_rr_cap(
     *,
     tick: float | None = None,
 ) -> float | None:
-    """Move stop outward so TP1 RR <= MAX_TP1_RISK_REWARD_RATIO (entry/TP unchanged).
-
-    Long: lower stop; short: raise stop. Returns None if geometry cannot be fixed.
-    """
-    import math
-
-    rr = compute_risk_reward(entry, take_profit, stop_loss, direction)
-    if rr is None:
-        return None
-    ratio = float(rr["ratio"])
-    if ratio <= MAX_TP1_RISK_REWARD_RATIO + 1e-9:
-        return stop_loss
-
-    reward = float(rr["reward"])
-    min_risk = reward / MAX_TP1_RISK_REWARD_RATIO
-    long = is_long_direction(direction)
-    t = tick if tick and tick > 0 else 0.0
-    min_rr = MIN_RISK_REWARD_RATIO
-
-    def _ratio_for_stop(candidate: float) -> float | None:
-        probe = compute_risk_reward(entry, take_profit, candidate, direction)
-        if probe is None:
-            return None
-        return float(probe["ratio"])
-
-    def _pick_tick_aligned_stop(ideal_stop: float, *, round_down: bool) -> float | None:
-        if not t:
-            return ideal_stop
-        scaled = ideal_stop / t
-        aligned = math.floor(scaled + 1e-12) * t if round_down else math.ceil(scaled - 1e-12) * t
-        return aligned
-
-    if long is True:
-        ideal_stop = entry - min_risk
-        if ideal_stop >= entry:
-            return None
-        candidates: list[float] = [ideal_stop]
-        if t:
-            candidates.extend(
-                s
-                for s in (
-                    _pick_tick_aligned_stop(ideal_stop, round_down=True),
-                    _pick_tick_aligned_stop(ideal_stop, round_down=False),
-                )
-                if s is not None
-            )
-        best: float | None = None
-        best_ratio: float | None = None
-        for candidate in candidates:
-            if candidate >= entry:
-                continue
-            cand_ratio = _ratio_for_stop(candidate)
-            if cand_ratio is None:
-                continue
-            if cand_ratio < min_rr - 1e-9 or cand_ratio > MAX_TP1_RISK_REWARD_RATIO + 1e-9:
-                continue
-            if best_ratio is None or cand_ratio > best_ratio:
-                best = candidate
-                best_ratio = cand_ratio
-        return best
-    if long is False:
-        ideal_stop = entry + min_risk
-        if ideal_stop <= entry:
-            return None
-        candidates = [ideal_stop]
-        if t:
-            candidates.extend(
-                s
-                for s in (
-                    _pick_tick_aligned_stop(ideal_stop, round_down=False),
-                    _pick_tick_aligned_stop(ideal_stop, round_down=True),
-                )
-                if s is not None
-            )
-        best = None
-        best_ratio = None
-        for candidate in candidates:
-            if candidate <= entry:
-                continue
-            cand_ratio = _ratio_for_stop(candidate)
-            if cand_ratio is None:
-                continue
-            if cand_ratio < min_rr - 1e-9 or cand_ratio > MAX_TP1_RISK_REWARD_RATIO + 1e-9:
-                continue
-            if best_ratio is None or cand_ratio > best_ratio:
-                best = candidate
-                best_ratio = cand_ratio
-        return best
-    return None
+    """Compatibility API: validate geometry and return the unchanged structural stop."""
+    _ = tick
+    return stop_loss if compute_risk_reward(entry, take_profit, stop_loss, direction) else None
 
 
 def adjust_decision_stop_for_tp1_rr_cap(
@@ -200,28 +114,9 @@ def adjust_decision_stop_for_tp1_rr_cap(
     kline_frame: Any = None,
     tick: float | None = None,
 ) -> bool:
-    """Widen stop_loss_price in-place when TP1 RR exceeds the program cap."""
-    if decision.get("order_type") not in ("限价单", "突破单", "市价单"):
-        return False
-    try:
-        entry = float(decision["entry_price"])
-        tp = float(decision["take_profit_price"])
-        sl = float(decision["stop_loss_price"])
-    except (TypeError, ValueError, KeyError):
-        return False
-
-    if tick is None and kline_frame is not None:
-        from pa_agent.util.price_tick import infer_price_tick_from_frame
-
-        tick = infer_price_tick_from_frame(kline_frame)
-
-    new_sl = widen_stop_for_tp1_rr_cap(
-        entry, tp, sl, decision.get("order_direction"), tick=tick
-    )
-    if new_sl is None or abs(new_sl - sl) < 1e-12:
-        return False
-    decision["stop_loss_price"] = new_sl
-    return True
+    """Deprecated compatibility shim which never mutates *decision*."""
+    _ = decision, kline_frame, tick
+    return False
 
 
 def passes_trader_equation(
@@ -234,6 +129,29 @@ def passes_trader_equation(
         return False
     p = max(0.0, min(100.0, float(win_rate_pct))) / 100.0
     return p * reward > (1.0 - p) * risk
+
+
+def compute_expectancy(
+    win_rate_pct: float,
+    risk: float,
+    reward: float,
+    *,
+    round_trip_cost: float | None = None,
+) -> dict[str, float | None | str]:
+    """Return gross and optional net expectancy per unit.
+
+    The win rate remains a model-provided, uncalibrated subjective estimate.
+    A missing cost intentionally yields ``net_expectancy=None``.
+    """
+    if risk <= 0 or reward <= 0:
+        raise ValueError("risk and reward must be positive")
+    p = max(0.0, min(100.0, float(win_rate_pct))) / 100.0
+    gross = p * reward - (1.0 - p) * risk
+    return {
+        "gross_expectancy": gross,
+        "net_expectancy": gross - float(round_trip_cost) if round_trip_cost is not None else None,
+        "win_rate_label": "未校准主观估计",
+    }
 
 
 def _parse_win_rate(value: object) -> float | None:
@@ -401,15 +319,14 @@ def validate_order_trade_metrics(
     decision_stance: str | None = None,
     kline_frame: Any = None,
     bar_analysis: dict[str, Any] | None = None,
-    apply_rr_cap_adjustment: bool = True,
+    apply_rr_cap_adjustment: bool = False,
 ) -> list[str]:
-    """Validate entry/TP/SL geometry, RR floor, and trader equation for live orders."""
+    """Validate geometry and the RR floor without modifying input prices."""
     order_type = decision.get("order_type")
     if order_type not in ("限价单", "突破单", "市价单"):
         return []
 
-    if apply_rr_cap_adjustment:
-        adjust_decision_stop_for_tp1_rr_cap(decision, kline_frame=kline_frame)
+    _ = apply_rr_cap_adjustment  # retained for source compatibility
 
     entry = decision.get("entry_price")
     tp = decision.get("take_profit_price")

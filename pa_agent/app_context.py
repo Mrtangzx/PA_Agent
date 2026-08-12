@@ -26,6 +26,11 @@ class AppContext:
     exp_reader: Any = None        # ExperienceReader
     ledger: Any = None            # SessionTokenLedger
 
+    # Local trading workflow. Initialization failure must never block analysis.
+    trade_store: Any = None       # TradeStore
+    trading_service: Any = None   # TradingService
+    trade_lifecycle: Any = None   # TradeLifecycleTracker
+
     @classmethod
     def bootstrap(cls) -> "AppContext":
         """Wire all real components and return a fully initialised AppContext."""
@@ -36,11 +41,9 @@ class AppContext:
             PROMPT_DIR,
         )
         from pa_agent.config.settings import load_settings
-        from pa_agent.util.logging import configure_logging, update_api_key
+        from pa_agent.util.logging import configure_logging
         from pa_agent.util.event_bus import EventBus
-        from pa_agent.util.mask_secret import mask_secret
         from pa_agent.data.factory import create_data_source, normalize_data_source_kind
-        from pa_agent.ai.client_factory import create_ai_client
         from pa_agent.ai.prompt_assembler import PromptAssembler
         from pa_agent.ai.router import route_strategy_files
         from pa_agent.ai.json_validator import JsonValidator
@@ -128,6 +131,17 @@ class AppContext:
             warn_pct=settings.general.context_warning_threshold_pct,
         )
 
+        from pa_agent.config.paths import TRADE_RECORDS_DIR, TRADES_DB_PATH
+        from pa_agent.trading.lifecycle import TradeLifecycleTracker
+        from pa_agent.trading.service import TradingService
+        from pa_agent.trading.store import TradeStore
+
+        trade_store = TradeStore(TRADES_DB_PATH, legacy_dir=TRADE_RECORDS_DIR)
+        trading_service = TradingService(trade_store, settings.risk)
+        trade_lifecycle = TradeLifecycleTracker(trade_store)
+        if not trade_store.available:
+            app_logger.error("交易数据库不可用（分析功能继续）: %s", trade_store.error)
+
         return cls(
             settings=settings,
             logger=app_logger,
@@ -140,4 +154,7 @@ class AppContext:
             pending_writer=pending_writer,
             exp_reader=exp_reader,
             ledger=ledger,
+            trade_store=trade_store,
+            trading_service=trading_service,
+            trade_lifecycle=trade_lifecycle,
         )

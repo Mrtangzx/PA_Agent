@@ -6,7 +6,7 @@ alarm payloads, validation errors, and experience entries.
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RecordMeta(BaseModel):
@@ -21,6 +21,12 @@ class RecordMeta(BaseModel):
     bar_count: int
     ai_provider: dict         # Sanitized provider config snapshot (no plaintext API key)
     decision_stance: str = "conservative"  # conservative | balanced | aggressive | extreme_aggressive
+    strategy_version: str = ""
+    feature_version: str = ""
+    prompt_snapshot: list[dict[str, str]] = Field(default_factory=list)
+    model_name: str = ""
+    app_git_commit: str = ""
+    price_adjustments: list[dict] = Field(default_factory=list)
 
 
 class AnalysisRecord(BaseModel):

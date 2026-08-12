@@ -347,6 +347,8 @@ _DECISION_BASE: dict = {
         "entry_rule": {"type": ["string", "null"]},
         "take_profit_price": {"type": ["number", "null"]},
         "take_profit_price_2": {"type": ["number", "null"]},
+        "take_profit_basis": {"type": ["string", "null"]},
+        "take_profit_basis_2": {"type": ["string", "null"]},
         "stop_loss_price": {"type": ["number", "null"]},
         "reasoning": {"type": "string", "minLength": 1, "maxLength": 280},
         "diagnosis_confidence": {"type": "integer", "minimum": 0, "maximum": 100},

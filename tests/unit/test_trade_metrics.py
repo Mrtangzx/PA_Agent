@@ -28,29 +28,29 @@ def test_compute_risk_reward_short():
 def test_rr_bounds_all_stances_share_one_floor() -> None:
     for stance in ("conservative", "balanced", "aggressive", "extreme_aggressive", None):
         assert min_risk_reward_ratio(stance) == 1.0
-    assert max_risk_reward_ratio() == 1.0
+    assert max_risk_reward_ratio() is None
 
 
-def test_widen_stop_for_tp1_rr_cap_long():
+def test_structural_stop_is_not_widened_for_high_rr_long():
     # entry=100, tp=110, stop=99 -> risk=1, reward=10, RR=10
     widened = widen_stop_for_tp1_rr_cap(100.0, 110.0, 99.0, "做多", tick=0.01)
     assert widened is not None
-    assert widened < 99.0
+    assert widened == 99.0
     rr = compute_risk_reward(100.0, 110.0, widened, "做多")
     assert rr is not None
-    assert rr["ratio"] <= 1.0 + 1e-9
+    assert rr["ratio"] == 10.0
 
 
-def test_widen_stop_for_tp1_rr_cap_short():
+def test_structural_stop_is_not_widened_for_high_rr_short():
     widened = widen_stop_for_tp1_rr_cap(100.0, 90.0, 101.0, "做空", tick=0.01)
     assert widened is not None
-    assert widened > 101.0
+    assert widened == 101.0
     rr = compute_risk_reward(100.0, 90.0, widened, "做空")
     assert rr is not None
-    assert rr["ratio"] <= 1.0 + 1e-9
+    assert rr["ratio"] == 10.0
 
 
-def test_adjust_decision_stop_for_tp1_rr_cap_mutates_decision():
+def test_adjust_decision_stop_for_tp1_rr_cap_is_noop():
     decision = {
         "order_type": "限价单",
         "order_direction": "做多",
@@ -58,7 +58,7 @@ def test_adjust_decision_stop_for_tp1_rr_cap_mutates_decision():
         "take_profit_price": 110.0,
         "stop_loss_price": 99.0,
     }
-    assert adjust_decision_stop_for_tp1_rr_cap(decision, tick=0.01)
+    assert not adjust_decision_stop_for_tp1_rr_cap(decision, tick=0.01)
     rr = compute_risk_reward(
         decision["entry_price"],
         decision["take_profit_price"],
@@ -66,7 +66,7 @@ def test_adjust_decision_stop_for_tp1_rr_cap_mutates_decision():
         decision["order_direction"],
     )
     assert rr is not None
-    assert rr["ratio"] <= 1.0
+    assert rr["ratio"] == 10.0
 
 
 def test_format_estimated_win_rate_from_model_field():

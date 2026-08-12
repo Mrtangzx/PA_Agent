@@ -53,5 +53,13 @@
   },
   "tushare": {
     "token": ""
+  },
+  "risk": {
+    "account_equity": null,
+    "available_cash": null,
+    "per_trade_risk_pct": 0.5,
+    "max_open_risk_pct": 1.5,
+    "daily_loss_warning_pct": 1.5,
+    "weekly_loss_warning_pct": 3.0
   }
 }

@@ -1,9 +1,7 @@
 """DecisionPanel — trading decision + market diagnosis summary."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
-from typing import Any
-
+from PyQt6.QtCore import Qt, pyqtSignal
 from pa_agent.util.trade_metrics import (
     compute_risk_reward,
     format_estimated_win_rate,
@@ -18,6 +16,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QPushButton,
     QSizePolicy,
     QTextEdit,
     QVBoxLayout,
@@ -113,6 +112,9 @@ class DecisionPanel(QWidget):
       市场诊断区 → 市场判断置信度 (Stage 2 diagnosis_confidence)
       交易决策区 → 交易决策置信度 (Stage 2 trade_confidence, inline on summary row)
     """
+
+    confirm_execution_requested = pyqtSignal()
+    ignore_plan_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -256,6 +258,24 @@ class DecisionPanel(QWidget):
             prices_layout.addWidget(lbl, stretch=1)
 
         layout.addWidget(self._trade_prices_row)
+
+        self._plan_actions = QWidget()
+        action_layout = QHBoxLayout(self._plan_actions)
+        action_layout.setContentsMargins(0, 4, 0, 4)
+        self._confirm_execution_button = QPushButton("确认已成交")
+        self._confirm_execution_button.setToolTip("录入真实成交；程序不会连接券商或自动下单")
+        self._ignore_plan_button = QPushButton("忽略方案")
+        self._confirm_execution_button.clicked.connect(self.confirm_execution_requested)
+        self._ignore_plan_button.clicked.connect(self.ignore_plan_requested)
+        action_layout.addWidget(self._confirm_execution_button)
+        action_layout.addWidget(self._ignore_plan_button)
+        action_layout.addStretch(1)
+        layout.addWidget(self._plan_actions)
+
+        self._risk_suggestion_label = QLabel()
+        self._risk_suggestion_label.setWordWrap(True)
+        self._risk_suggestion_label.setStyleSheet("font-size: 13px; color: #c9d1d9;")
+        layout.addWidget(self._risk_suggestion_label)
 
         self._trade_conf_title = QLabel("交易决策置信度")
         self._trade_conf_title.setStyleSheet("font-weight: bold; margin-top: 4px;")
@@ -432,6 +452,7 @@ class DecisionPanel(QWidget):
         self._apply_market_diagnosis(diagnosis_summary, stage1_diagnosis)
 
         order_type = decision.get("order_type", _NO_ORDER)
+        has_trade_plan = order_type != _NO_ORDER
         reasoning = decision.get("reasoning", decision.get("brief_reasoning", ""))
         # Confidence gate: suppress order display when confidence < threshold
         if confidence_threshold is not None and confidence_threshold > 0 and order_type != _NO_ORDER:
@@ -545,6 +566,27 @@ class DecisionPanel(QWidget):
             )
 
         self._reasoning_edit.setPlainText(str(reasoning) if reasoning else "")
+        self._plan_actions.setVisible(has_trade_plan)
+        metrics = decision.get("program_trade_metrics") or {}
+        risk = decision.get("risk_suggestion") or {}
+        if has_trade_plan:
+            gross = metrics.get("gross_expectancy")
+            net = metrics.get("net_expectancy")
+            gross_text = "无法计算" if gross is None else f"{float(gross):.2f}"
+            net_text = "成本未配置" if net is None else f"{float(net):.2f}"
+            quantity = risk.get("quantity")
+            quantity_text = "无法计算" if quantity is None else str(quantity)
+            missing = risk.get("missing_fields") or []
+            suffix = f"；缺少 {', '.join(missing)}" if missing else ""
+            self._risk_suggestion_label.setText(
+                f"模型胜率：未校准主观估计 · 毛期望 {gross_text} · 成本后期望 {net_text}\n"
+                f"建议数量 {quantity_text} · 预计成本 {risk.get('estimated_cost', '—')} · "
+                f"最坏情形 {risk.get('worst_case_amount', '—')}{suffix}"
+            )
+            self._risk_suggestion_label.setVisible(True)
+        else:
+            self._risk_suggestion_label.clear()
+            self._risk_suggestion_label.setVisible(False)
 
     def clear(self) -> None:
         self._trend_label.setText("趋势：—")
@@ -574,3 +616,6 @@ class DecisionPanel(QWidget):
         self._trade_reasoning_label.setVisible(False)
 
         self._reasoning_edit.clear()
+        self._plan_actions.setVisible(False)
+        self._risk_suggestion_label.clear()
+        self._risk_suggestion_label.setVisible(False)

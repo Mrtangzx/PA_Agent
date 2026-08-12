@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from pa_agent.trading.models import RiskSettings
+
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
 DataSourceKind = Literal["mt5", "tradingview", "akshare", "eastmoney", "eastmoney_futures", "tushare"]
 NormalizationMode = Literal["strict", "lenient"]
@@ -167,6 +169,7 @@ class Settings(BaseModel):
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
+    risk: RiskSettings = Field(default_factory=RiskSettings)
 
 
 def provider_api_key_configured(settings: Settings | None) -> bool:

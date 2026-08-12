@@ -17,9 +17,9 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMenuBar,
     QMessageBox,
+    QInputDialog,
     QPushButton,
     QSizePolicy,
-    QSpinBox,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
@@ -276,6 +276,9 @@ class MainWindow(QMainWindow):
         self._last_stage1_diagnosis: dict | None = None
         self._last_analysis_record: Any = None
         self._last_analysis_frame: Any = None  # KlineFrame of the most recent analysis
+        self._current_trade_plan_id: str | None = None
+        self._trade_ledger_window: Any = None
+        self._trade_last_closed_ts: dict[tuple[str, str], int] = {}
         self._analysis_previous_record: Any = None  # incremental base record for chart continuity
         self._demo_mode = False
         self._demo_mode_kind: str | None = None  # manual | auto
@@ -317,6 +320,8 @@ class MainWindow(QMainWindow):
         self._debug_widget = self._ai_sidebar.debug
         self._prompt_files_panel = self._ai_sidebar.prompt_files
         self._decision_panel = self._ai_sidebar.decision
+        self._decision_panel.confirm_execution_requested.connect(self._confirm_current_execution)
+        self._decision_panel.ignore_plan_requested.connect(self._ignore_current_plan)
         self._future_trend_panel = self._ai_sidebar.future_trend
         self._decision_tree_panel = self._ai_sidebar.decision_tree
         self._decision_flow_viz_panel = self._ai_sidebar.decision_flow_viz
@@ -343,6 +348,12 @@ class MainWindow(QMainWindow):
         self._demo_mode_label.hide()
         self._status_bar.addWidget(self._demo_mode_label, 1)
         self._status_bar.showMessage("就绪")
+        trade_store = getattr(self._ctx, "trade_store", None)
+        if trade_store is not None and not trade_store.available:
+            self._trade_db_status = QLabel("交易记录持久化故障")
+            self._trade_db_status.setStyleSheet("color: #f85149; font-weight: 600;")
+            self._trade_db_status.setToolTip(trade_store.error)
+            self._status_bar.addPermanentWidget(self._trade_db_status)
         self._refresh_api_key_ui_state()
 
         # ── Menu bar ─── 顶层直接触发按钮 + 演示模式下拉 ────────────────────
@@ -366,6 +377,11 @@ class MainWindow(QMainWindow):
         _general_action = QAction("其他通用设置", self)
         _general_action.triggered.connect(self._open_general_settings_dialog)
         menu_bar.addAction(_general_action)
+
+        trade_menu = menu_bar.addMenu("交易管理")
+        ledger_action = QAction("交易台账", self)
+        ledger_action.triggered.connect(self._open_trade_ledger)
+        trade_menu.addAction(ledger_action)
 
         # 4. 演示模式 — 保留下拉菜单
         demo_menu = menu_bar.addMenu("演示模式")
@@ -1719,7 +1735,6 @@ class MainWindow(QMainWindow):
 
         from pa_agent.ai.prompt_assembler import PromptAssembler
 
-        data_source = getattr(self._ctx, "data_source", None)
         chart = getattr(self, "_chart_widget", None)
         display_frame = None
         export_frame = None
@@ -1816,6 +1831,7 @@ class MainWindow(QMainWindow):
             )
             if ts is not None:
                 self._last_forming_ts_open = ts
+            self._update_trade_lifecycle_from_bars(bars, forming_ts=ts)
 
             # FlowBar step 0: data connected
             flow = getattr(self, "_flow_bar", None)
@@ -2773,8 +2789,6 @@ class MainWindow(QMainWindow):
 
     def _exit_demo_mode(self, *, silent: bool = False) -> None:
         """Leave demo mode and restore live controls."""
-        from pathlib import Path
-
         self._demo_auto_next_armed = False
         self._demo_waiting_flow_playback = False
         if self._demo_replayer is not None:
@@ -3350,6 +3364,12 @@ class MainWindow(QMainWindow):
                 cooldown = int(
                     getattr(self._ctx.settings.general, "structure_flip_cooldown_bars", 3) or 3
                 )
+            persistence = self._persist_trade_decision(inner, decision)
+            if persistence:
+                inner = persistence.get("final_decision", inner)
+                self._current_trade_plan_id = persistence.get("plan_id")
+            else:
+                self._current_trade_plan_id = None
             chart_decision = enrich_decision_for_chart_overlay(
                 inner,
                 stage2_full=decision if isinstance(decision, dict) else None,
@@ -3965,59 +3985,212 @@ class MainWindow(QMainWindow):
             confidence_threshold=self._confidence_threshold(),
         )
 
+    def _persist_trade_decision(self, inner: dict, decision: dict) -> dict | None:
+        """Persist all completed Stage-2 decisions independently of alert gates."""
+        if getattr(self, "_demo_mode", False):
+            return None
+        service = getattr(self._ctx, "trading_service", None)
+        store = getattr(self._ctx, "trade_store", None)
+        if service is None or store is None or not store.available:
+            if store is not None:
+                self._status_bar.showMessage(f"分析完成，但交易记录失败：{store.error}", 15000)
+            return None
+        frame = getattr(self, "_last_analysis_frame", None)
+        symbol = getattr(frame, "symbol", "") or self._symbol_combo.currentText().strip()
+        timeframe = getattr(frame, "timeframe", "") or self._tf_combo.currentText()
+        record = getattr(self, "_last_analysis_record", None)
+        meta_obj = getattr(record, "meta", None)
+        meta = meta_obj.model_dump(mode="json") if hasattr(meta_obj, "model_dump") else {}
+        meta.setdefault("model_name", getattr(self._ctx.settings.provider, "model", ""))
+        meta["adjustment_mode"] = getattr(self._ctx.settings.general, "kline_adjust", "")
+        try:
+            from pa_agent.trading.service import analysis_record_reference
+
+            model_original = None
+            if record is not None:
+                try:
+                    import json as _json
+                    from pa_agent.ai.response_extract import content_from_response
+
+                    raw_text = content_from_response(getattr(record, "stage2_response", None)).strip()
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text.split("\n", 1)[-1].rsplit("```", 1)[0]
+                    raw_obj = _json.loads(raw_text)
+                    if isinstance(raw_obj, dict):
+                        candidate = raw_obj.get("decision", raw_obj)
+                        if isinstance(candidate, dict):
+                            model_original = candidate
+                except Exception:  # noqa: BLE001
+                    model_original = None
+
+            return service.persist_stage2_decision(
+                decision_inner=inner, model_original_decision=model_original,
+                stage2_full=decision, symbol=symbol, timeframe=timeframe,
+                data_source=getattr(self._ctx.settings.general, "last_data_source", ""),
+                record_meta=meta, analysis_record_ref=analysis_record_reference(record),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Stage-2 trading audit persistence failed")
+            self._status_bar.showMessage(f"分析完成，但交易记录失败：{exc}", 15000)
+            return None
+
+    def _confirm_current_execution(self) -> None:
+        plan_id = self._current_trade_plan_id
+        store = getattr(self._ctx, "trade_store", None)
+        if not plan_id or store is None or not store.available:
+            QMessageBox.information(self, "没有可确认方案", "当前决策没有可执行计划，或交易数据库不可用。")
+            return
+        plan = store.get_plan(plan_id)
+        if not plan:
+            return
+        from pa_agent.gui.trade_dialogs import ExecutionDialog
+
+        dialog = ExecutionDialog(plan, self)
+        suggested = (plan.get("risk_snapshot") or {}).get("quantity")
+        if suggested:
+            dialog.quantity.setValue(float(suggested))
+        if dialog.exec():
+            execution = dialog.execution()
+            try:
+                from pa_agent.trading.profiles import default_profile
+                from pa_agent.trading.risk import calculate_position_size
+
+                profile = store.get_profile(plan["symbol"])
+                if profile is None:
+                    profile = default_profile(
+                        plan["symbol"], getattr(self._ctx.settings.general, "last_data_source", ""),
+                        getattr(self._ctx.settings.general, "kline_adjust", ""),
+                    )
+                if execution.real_contract:
+                    profile = store.get_profile(execution.real_contract) or profile
+                    profile = profile.model_copy(update={"real_contract": execution.real_contract})
+                open_risk = sum(
+                    float((item.get("risk_snapshot") or {}).get("planned_risk") or 0)
+                    for item in store.list_plans(statuses=["executed_open", "exit_detected"])
+                )
+                refreshed_risk = calculate_position_size(
+                    entry_price=execution.price, stop_loss_price=plan["stop_loss_price"],
+                    profile=profile, settings=self._ctx.settings.risk,
+                    current_open_risk=open_risk,
+                )
+                suggested = refreshed_risk.get("quantity")
+                if suggested is None:
+                    missing = ", ".join(refreshed_risk.get("missing_fields") or [])
+                    QMessageBox.warning(self, "无法计算建议数量", f"缺少：{missing}。不会使用猜测值。")
+                elif float(suggested) != execution.quantity:
+                    answer = QMessageBox.question(
+                        self, "实际数量偏离建议",
+                        f"程序建议数量 {suggested}，你录入 {execution.quantity}；"
+                        f"最坏情形约 {refreshed_risk.get('worst_case_amount', '—')}。仍要记录吗？",
+                    )
+                    if answer != QMessageBox.StandardButton.Yes:
+                        return
+                store.confirm_execution(execution)
+                if suggested is not None and float(suggested) != execution.quantity:
+                    risk = refreshed_risk
+                    base = float(suggested) or 1.0
+                    planned = float(risk.get("planned_risk") or 0)
+                    difference = planned * (execution.quantity / base - 1.0)
+                    QMessageBox.warning(
+                        self, "实际数量偏离建议",
+                        f"建议数量 {suggested}，实际数量 {execution.quantity}；估计风险差异 {difference:+.2f}。",
+                    )
+                else:
+                    QMessageBox.information(self, "已记录", "真实成交已记录；后续退出仍需人工确认。")
+                self._current_trade_plan_id = None
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, "成交记录失败", str(exc))
+
+    def _ignore_current_plan(self) -> None:
+        plan_id = self._current_trade_plan_id
+        store = getattr(self._ctx, "trade_store", None)
+        if not plan_id or store is None or not store.available:
+            return
+        reason, ok = QInputDialog.getText(self, "忽略方案", "原因（原始信号和影子跟踪仍会保留）：")
+        if ok:
+            store.ignore_plan(plan_id, reason.strip())
+            self._current_trade_plan_id = None
+            QMessageBox.information(self, "已忽略", "方案已标记忽略；影子结果仍继续用于策略评价。")
+
+    def _open_trade_ledger(self) -> None:
+        from pa_agent.gui.trade_ledger_window import TradeLedgerWindow
+
+        if self._trade_ledger_window is None:
+            self._trade_ledger_window = TradeLedgerWindow(self._ctx, self)
+        self._trade_ledger_window.refresh()
+        self._trade_ledger_window.show()
+        self._trade_ledger_window.raise_()
+        self._trade_ledger_window.activateWindow()
+
+    def _update_trade_lifecycle_from_bars(self, bars: Any, *, forming_ts: int | None) -> None:
+        """Backfill unseen closed bars so restarts resume unfinished plans."""
+        tracker = getattr(self._ctx, "trade_lifecycle", None)
+        store = getattr(self._ctx, "trade_store", None)
+        if tracker is None or store is None or not store.available:
+            return
+        symbol = self._symbol_combo.currentText().strip()
+        timeframe = self._tf_combo.currentText()
+        key = (symbol, timeframe)
+        last_ts = self._trade_last_closed_ts.get(key)
+        limit_labels: dict[int, str] = {}
+        try:
+            from pa_agent.data.ashare_limits import limit_labels_for_frame
+            from pa_agent.trading.models import AssetClass
+            from pa_agent.trading.profiles import infer_asset_class
+
+            source = getattr(self._ctx.settings.general, "last_data_source", "")
+            if infer_asset_class(symbol, source) is AssetClass.A_SHARE:
+                labels = limit_labels_for_frame(bars, symbol)
+                limit_labels = {
+                    int(getattr(bar, "ts_open")): label
+                    for bar, label in zip(bars, labels, strict=False)
+                    if getattr(bar, "ts_open", None) is not None
+                }
+        except Exception:  # noqa: BLE001
+            limit_labels = {}
+        closed: list[tuple[int, Any]] = []
+        for bar in bars:
+            raw_ts = getattr(bar, "ts_open", None)
+            if raw_ts is None:
+                continue
+            ts_value = int(raw_ts)
+            if forming_ts is not None and ts_value == int(forming_ts):
+                continue
+            if last_ts is None or ts_value > last_ts:
+                closed.append((ts_value, bar))
+        for ts_value, bar in sorted(closed, key=lambda item: item[0]):
+            try:
+                events = tracker.process_closed_bar(
+                    symbol=symbol, timeframe=timeframe, bar=bar,
+                    quote_available=all(
+                        isinstance(getattr(bar, field, None), (int, float))
+                        for field in ("open", "high", "low", "close")
+                    ),
+                    suspended=(float(getattr(bar, "volume", 1) or 0) == 0 and bool(limit_labels)),
+                    price_limit_locked=limit_labels.get(ts_value, "").startswith("一字"),
+                )
+                if any(event["event_type"] == "entry_touched" for event in events):
+                    self._status_bar.showMessage("交易计划价格已触及，请人工核实是否真实成交。", 10000)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Trade lifecycle update failed: %s", exc)
+            self._trade_last_closed_ts[key] = ts_value
+
     def _spawn_post_order_followup(self, inner: dict, decision: dict) -> None:
-        """Run trade CSV/chart + notifications off the UI thread (can take seconds)."""
+        """Run user notifications off the UI thread; SQLite was already persisted."""
         import threading
 
         settings = getattr(self._ctx, "settings", None)
-        model_name = ""
         meta_symbol = ""
         meta_timeframe = ""
-        decision_stance = ""
         if settings is not None:
-            model_name = getattr(settings.provider, "model", "") or ""
             meta_symbol = getattr(settings.general, "last_symbol", "") or ""
             meta_timeframe = getattr(settings.general, "last_timeframe", "") or ""
-            decision_stance = getattr(settings.general, "decision_stance", "") or ""
-        stage1_diag = self._current_stage1_diagnosis() or None
-        frame = getattr(self, "_last_analysis_frame", None)
 
         def _run() -> None:
             try:
-                from pa_agent.records.trade_logger import save_trade_record
-
-                save_trade_record(
-                    decision_inner=inner,
-                    stage2_full=decision,
-                    stage1_diagnosis=stage1_diag,
-                    frame=frame,
-                    meta_symbol=meta_symbol,
-                    meta_timeframe=meta_timeframe,
-                    decision_stance=decision_stance,
-                    model_name=model_name,
-                    structure_flip_cooldown_bars=int(
-                        getattr(settings.general, "structure_flip_cooldown_bars", 3) or 3
-                    )
-                    if settings is not None
-                    else 3,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Trade record logging failed: %s", exc)
-
-            try:
                 from pa_agent.notify.feishu_notifier import send_order_signal as send_feishu_order
                 from pa_agent.notify.pushplus_notifier import send_order_signal as send_pushplus_order
-                from pa_agent.records.trade_logger import _TRADE_RECORDS_DIR
-
-                safe_sym = meta_symbol.replace("/", "-").replace("\\", "-")
-                safe_tf = meta_timeframe.replace("/", "-")
-                img_glob = f"{safe_sym}_{safe_tf}_*.png"
-                candidates = sorted(
-                    _TRADE_RECORDS_DIR.glob(img_glob),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                latest_img = candidates[0] if candidates else None
+                latest_img = None
 
                 send_feishu_order(
                     decision_inner=inner,
@@ -4382,8 +4555,6 @@ class MainWindow(QMainWindow):
                 compute_incremental_bar_delta,
                 find_latest_successful_record,
             )
-            from pa_agent.data.snapshot import INDICATOR_WARMUP_BARS
-
             bar_count = self._analysis_bar_count()
             frame = self._build_chart_frame_from_bars(
                 bars,

@@ -232,6 +232,9 @@ def _build_empty_record(
             getattr(settings.general, "decision_stance", "conservative")
         )
 
+    from pa_agent.config.paths import PROJECT_ROOT
+    from pa_agent.trading.versioning import FEATURE_VERSION, STRATEGY_VERSION, git_revision
+
     meta = RecordMeta(
         timestamp_local_iso=ts_iso,
         timestamp_local_ms=ts_ms,
@@ -240,6 +243,10 @@ def _build_empty_record(
         bar_count=len(frame.bars),
         ai_provider=ai_provider,
         decision_stance=decision_stance,
+        strategy_version=STRATEGY_VERSION,
+        feature_version=FEATURE_VERSION,
+        model_name=str(ai_provider.get("model", "")),
+        app_git_commit=git_revision(PROJECT_ROOT),
     )
 
     return AnalysisRecord(
@@ -257,6 +264,17 @@ def _build_empty_record(
         exception=None,
         usage_total={},
     )
+
+
+def _with_prompt_audit(record: AnalysisRecord, strategy_files: list[str]) -> AnalysisRecord:
+    """Attach the exact used prompt file set and SHA-256 values."""
+    from pa_agent.ai.prompt_assembler import stage1_prompt_txt_files, stage2_prompt_txt_files
+    from pa_agent.config.paths import PROMPT_DIR
+    from pa_agent.trading.versioning import prompt_snapshot
+
+    names = list(dict.fromkeys(stage1_prompt_txt_files() + stage2_prompt_txt_files(strategy_files)))
+    snapshot = prompt_snapshot(PROMPT_DIR / name for name in names)
+    return record.model_copy(update={"meta": record.meta.model_copy(update={"prompt_snapshot": snapshot})})
 
 
 def _accumulate_usage(current: dict, reply_usage: Any) -> dict:
@@ -680,6 +698,7 @@ class TwoStageOrchestrator:
                     "exception": None,
                 }
             )
+            record = _with_prompt_audit(record, strategy_files)
             self._pending_writer.save_full(record)
             on_event(OrchestratorEvent.RecordSaved)
             return record
@@ -973,6 +992,7 @@ class TwoStageOrchestrator:
                 "exception": None,
             }
         )
+        record = _with_prompt_audit(record, strategy_files)
 
         # ── Step 22: Persist full record ──────────────────────────────────────
         self._pending_writer.save_full(record)
