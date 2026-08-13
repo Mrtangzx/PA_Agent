@@ -75,6 +75,21 @@ def enrich_decision_for_chart_overlay(
     if not has_trade_prices(prev):
         return out
 
+    # Even when a resting limit order was never filled (so lifecycle correctly
+    # does not record a stop-out), do not keep drawing a plan whose market has
+    # already traded through its protective stop.  This is display invalidation
+    # only and does not turn an unfilled order into a completed trade.
+    bars = list(getattr(frame, "bars", ()) or ())
+    if bars:
+        latest = bars[0]
+        stop = _parse_price(prev.get("stop_loss_price"))
+        direction = str(prev.get("order_direction") or "")
+        if stop is not None:
+            if "多" in direction and float(getattr(latest, "low", stop)) <= stop:
+                return out
+            if "空" in direction and float(getattr(latest, "high", stop)) >= stop:
+                return out
+
     out["chart_overlay_active"] = True
     for key in (
         "order_direction",

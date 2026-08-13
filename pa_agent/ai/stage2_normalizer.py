@@ -411,6 +411,26 @@ def _normalize_stage2_enum_aliases(out: dict[str, Any]) -> bool:
             bar_analysis["always_in"] = mapped_ai
             logger.debug("always_in %r -> %r", raw_ai, mapped_ai)
             changed = True
+        entry_bar = bar_analysis.get("entry_bar")
+        if isinstance(entry_bar, dict):
+            raw_freshness = entry_bar.get("freshness")
+            if _normalize_entry_bar_freshness(entry_bar):
+                logger.debug(
+                    "entry_bar.freshness %r -> %r",
+                    raw_freshness,
+                    entry_bar.get("freshness"),
+                )
+                changed = True
+            raw_strength = entry_bar.get("strength")
+            strength = _normalize_closed_enum(
+                raw_strength,
+                _ENTRY_BAR_STRENGTH_ENUM,
+                aliases=_ENTRY_BAR_STRENGTH_ALIASES,
+            )
+            if strength and strength != raw_strength:
+                entry_bar["strength"] = strength
+                logger.debug("entry_bar.strength %r -> %r", raw_strength, strength)
+                changed = True
 
     terminal = out.get("terminal")
     if isinstance(terminal, dict):
@@ -908,7 +928,7 @@ def _coerce_decision_when_trade_metrics_fail(
     decision = out.get("decision")
     if not isinstance(decision, dict) or decision.get("order_type") not in _TRADE_ORDER_TYPES:
         return False
-    if decision.get("entry_price") is None:
+    if decision.get("entry_price") is None or decision_stance is None:
         return False
 
     from pa_agent.util.trade_metrics import validate_order_trade_metrics

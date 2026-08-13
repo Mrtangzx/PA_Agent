@@ -1,11 +1,11 @@
 """Unit tests for settings load/save round-trip (task 2.4)."""
 from __future__ import annotations
+
 import json
 from unittest.mock import patch
 
-import pytest
-from pathlib import Path
 from pa_agent.config.settings import Settings, load_settings, save_settings
+from pa_agent.trading.topdown import TOPDOWN_STRATEGY_ID
 
 
 def test_defaults(tmp_path):
@@ -17,12 +17,18 @@ def test_defaults(tmp_path):
     assert s.provider.thinking is True
     assert s.provider.reasoning_effort == "high"
     assert s.provider.context_window == 2_000_000
-    assert s.general.analysis_bar_count == 100
+    assert s.general.analysis_bar_count == 150
     assert s.general.last_symbol == "XAUUSDm"
     assert s.general.last_timeframe == "15m"
     assert s.general.decision_stance == "balanced"
     assert s.general.decision_flow_auto_play is True
     assert s.general.auto_resume_chart_after_analysis is False
+    assert s.strategy.strategy_id == "cloud_ai_daily_pullback_v1"
+    assert s.strategy.stock_pool_size == 11
+    assert s.topdown_scoring.strategy_version == TOPDOWN_STRATEGY_ID
+    assert s.topdown_scoring.consecutive_pass_bars == 2
+    assert s.portfolio_risk.initial_per_trade_risk_pct == 0.25
+    assert s.portfolio_risk.initial_max_open_risk_pct == 1.0
     assert p.exists(), "defaults should be written to disk"
 
 
@@ -38,6 +44,25 @@ def test_round_trip(tmp_path):
     # Crypto symbols migrate to gold defaults on load
     assert loaded.general.last_symbol == "XAUUSDm"
     assert loaded.provider.model == original.provider.model
+
+
+def test_legacy_hs300_quant_settings_migrate_to_fixed_cloud_pool(tmp_path):
+    p = tmp_path / "settings.json"
+    data = Settings().model_dump(mode="json")
+    data["strategy"].update({
+        "strategy_id": "hs300_daily_pullback_v1",
+        "stock_pool_size": 30,
+    })
+    data["topdown_scoring"]["strategy_version"] = "hs300_topdown_4321_intraday_v1"
+    p.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = load_settings(p)
+
+    assert loaded.strategy.strategy_id == "cloud_ai_daily_pullback_v1"
+    assert loaded.strategy.stock_pool_size == 11
+    assert loaded.topdown_scoring.strategy_version == "cloud_ai_topdown_4321_intraday_v1"
+    persisted = json.loads(p.read_text(encoding="utf-8"))
+    assert persisted["strategy"]["stock_pool_size"] == 11
 
 
 def test_api_key_present_on_disk(tmp_path):

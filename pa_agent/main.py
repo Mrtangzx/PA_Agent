@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Update logging with the real API key now that settings are loaded
     if ctx.settings is not None:
-        from pa_agent.util.logging import configure_logging, update_api_key
+        from pa_agent.util.logging import configure_logging
         configure_logging(api_key=ctx.settings.provider.api_key)
         from pa_agent.util.crash_diagnostics import log_startup_diagnostics
         log_startup_diagnostics()
@@ -42,6 +42,13 @@ def main(argv: list[str] | None = None) -> int:
     from pa_agent.gui.main_window import MainWindow
     window = MainWindow(ctx)
     window.show()
+
+    # Quant collection is an application concern, not a workbench-window
+    # concern.  It remains active even if the user never opens that window.
+    quant_runtime = getattr(ctx, "quant_runtime", None)
+    if quant_runtime is not None:
+        quant_runtime.start()
+        app.aboutToQuit.connect(quant_runtime.stop)
 
     logger.info("Main window shown")
     return app.exec()

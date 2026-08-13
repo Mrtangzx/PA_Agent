@@ -3,14 +3,12 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from pa_agent.util.threading import CancelToken
 
-from pa_agent.config.settings import AIProviderSettings
-from pa_agent.util.mask_secret import mask_secret
 from pa_agent.ai.mimo_compat import (
     ReasoningCache,
     is_mimo_provider,
@@ -20,6 +18,8 @@ from pa_agent.ai.mimo_compat import (
     response_message_dict,
     store_reasoning_from_response,
 )
+from pa_agent.config.settings import AIProviderSettings
+from pa_agent.util.mask_secret import mask_secret
 
 try:
     from openai import OpenAI as _OpenAI  # type: ignore[import]
@@ -192,6 +192,7 @@ def _is_minimax(base_url: str) -> bool:
 _PACKY_CLAUDE_MAX_OUTPUT_TOKENS = 128_000
 # DeepSeek API: max_tokens must be in [1, 393216].
 _DEEPSEEK_MAX_OUTPUT_TOKENS = 393_216
+_KKAI_MAX_OUTPUT_TOKENS = 999_999
 
 
 def _model_uses_claude_adaptive(model: str) -> bool:
@@ -232,7 +233,7 @@ _PRACTICAL_UNLIMITED_THINKING_BUDGET = 524287
 def _effort_budget_tokens(effort: str | None, *, max_output: int) -> int:
     """Thinking budget; must stay below max_output (Anthropic/Packy rule)."""
     del effort  # reserved for future per-effort tuning
-    return min(_PRACTICAL_UNLIMITED_THINKING_BUDGET, max(1024, max_output - 1))
+    return max(1024, max_output - 1)
 
 
 def _thinking_enabled(extra_body: dict[str, Any], effort: str | None) -> bool:
@@ -289,9 +290,10 @@ def _prepare_api_messages(
 
 def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
     """Per-gateway completion cap (max_tokens); avoids 400 from provider limits."""
-    model = (settings.model or "").lower()
-    if _is_packyapi(settings.base_url) and "claude" in model:
+    if _is_packyapi(settings.base_url):
         return _PACKY_CLAUDE_MAX_OUTPUT_TOKENS
+    if _is_kkai_openai_proxy(settings.base_url):
+        return _KKAI_MAX_OUTPUT_TOKENS
     if _is_deepseek_native(settings.base_url):
         return _DEEPSEEK_MAX_OUTPUT_TOKENS
     if _is_mimo(settings):
@@ -321,21 +323,35 @@ def _resolve_thinking_params(
     _effort = reasoning_effort if reasoning_effort is not None else settings.reasoning_effort
     model = settings.model or ""
 
-    if _is_deepseek_native(settings.base_url) or _is_deepseek_model(model):
-        # DeepSeek v4+ requires thinking.type=adaptive + output_config.effort;
-        # the old "enabled"/"disabled" values are no longer accepted.
-        # Also covers DeepSeek models proxied through non-native gateways (e.g. QClaw).
+    # Provider-specific proxy contracts take precedence over a model name.
+    # KKAI rejects reasoning_effort and expects an Anthropic-style budget.
+    if _is_kkai_openai_proxy(settings.base_url):
+        if not _thinking:
+            return {}, None
+        max_out = _completion_max_tokens(settings, extra_body={}, effort=_effort)
+        budget = _effort_budget_tokens(_effort, max_output=max_out)
+        return ({"thinking": {"type": "enabled", "budget_tokens": budget}}, None)
+
+    if _is_deepseek_native(settings.base_url):
         if _thinking:
-            extra_body: dict[str, Any] = {
-                "thinking": {"type": "adaptive"},
-                "output_config": {"effort": _adaptive_output_effort(_effort)},
-            }
+            extra_body: dict[str, Any] = {"thinking": {"type": "enabled"}}
             return extra_body, _effort or "medium"
         else:
             extra_body = {
                 "thinking": {"type": "disabled"},
             }
             return extra_body, None
+
+    if _is_deepseek_model(model):
+        if _thinking:
+            return (
+                {
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": _adaptive_output_effort(_effort)},
+                },
+                _effort or "medium",
+            )
+        return {"thinking": {"type": "disabled"}}, None
 
     if _is_minimax(settings.base_url):
         # MiniMax (api.minimax.io):
@@ -370,14 +386,6 @@ def _resolve_thinking_params(
 
     if _is_packyapi(settings.base_url) and "claude" in model.lower():
         # Packy (e.g. claude-officially): budget_tokens only; reasoning_effort rejected.
-        budget = _effort_budget_tokens(_effort, max_output=max_out)
-        return (
-            {"thinking": {"type": "enabled", "budget_tokens": budget}},
-            None,
-        )
-
-    if _is_kkai_openai_proxy(settings.base_url):
-        # KKAI claude-opus-4-5: reasoning_effort -> 503 paprika_mode on some routes.
         budget = _effort_budget_tokens(_effort, max_output=max_out)
         return (
             {"thinking": {"type": "enabled", "budget_tokens": budget}},
@@ -605,7 +613,7 @@ class DeepSeekClient:
 
         from pa_agent.ai.cursor_connector import is_openclaw_cs_model
 
-        if is_openclaw_cs_model(self._settings.model):
+        if is_openclaw_cs_model(self._settings.model) and not self._settings.base_url:
             raise RuntimeError(
                 "模型 openclaw_cs 必须使用 Cursor SDK 路由，但当前仍在使用 DeepSeekClient。"
                 "请在「AI 模型」设置中重新保存，或重启应用后再分析。"

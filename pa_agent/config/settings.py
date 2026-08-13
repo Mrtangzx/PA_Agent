@@ -4,7 +4,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from pa_agent.trading.broker_models import ThsBinding
 from pa_agent.trading.models import RiskSettings
+from pa_agent.trading.portfolio import PortfolioRiskSettings
+from pa_agent.trading.quant import StrategySettings
+from pa_agent.trading.topdown import TopDownScoringSettings
 
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
 DataSourceKind = Literal["mt5", "tradingview", "akshare", "eastmoney", "eastmoney_futures", "tushare"]
@@ -63,7 +67,7 @@ class GeneralSettings(BaseModel):
     """UI and data-feed general settings."""
     model_config = ConfigDict(extra="ignore")
 
-    analysis_bar_count: int = Field(default=100, ge=2, le=5000)
+    analysis_bar_count: int = Field(default=150, ge=2, le=5000)
     refresh_interval_ms: int = 1000
     context_warning_threshold_pct: float = 80.0
     last_data_source: DataSourceKind = "mt5"
@@ -170,6 +174,10 @@ class Settings(BaseModel):
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
+    strategy: StrategySettings = Field(default_factory=StrategySettings)
+    topdown_scoring: TopDownScoringSettings = Field(default_factory=TopDownScoringSettings)
+    portfolio_risk: PortfolioRiskSettings = Field(default_factory=PortfolioRiskSettings)
+    ths: ThsBinding = Field(default_factory=ThsBinding)
 
 
 def provider_api_key_configured(settings: Settings | None) -> bool:
@@ -264,8 +272,18 @@ def load_settings(path: Path | None = None) -> "Settings":
     raw.setdefault("provider", {}).setdefault("api_key", "")
 
     migrated_feishu = _migrate_legacy_feishu_json(raw, path)
+    migrated_quant_universe = False
+    strategy = raw.setdefault("strategy", {})
+    if strategy.get("strategy_id") == "hs300_daily_pullback_v1":
+        strategy["strategy_id"] = "cloud_ai_daily_pullback_v1"
+        strategy["stock_pool_size"] = 11
+        migrated_quant_universe = True
+    topdown = raw.setdefault("topdown_scoring", {})
+    if topdown.get("strategy_version") == "hs300_topdown_4321_intraday_v1":
+        topdown["strategy_version"] = "cloud_ai_topdown_4321_intraday_v1"
+        migrated_quant_universe = True
     settings = Settings.model_validate(raw)
-    dirty = migrated_feishu
+    dirty = migrated_feishu or migrated_quant_universe
     if settings.pushplus.enabled and not settings.pushplus.token.strip():
         if not (os.environ.get("PUSHPLUS_TOKEN") or "").strip():
             settings.pushplus.enabled = False

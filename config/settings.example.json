@@ -1,15 +1,15 @@
 {
   "provider": {
-    "backend": "openai_compatible",
-    "model": "deepseek-chat",
-    "base_url": "https://api.deepseek.com",
+    "backend": "codex_sdk",
+    "model": "gpt-5.6-terra",
+    "base_url": "",
     "api_key_encrypted": "",
     "thinking": true,
     "reasoning_effort": "high",
-    "context_window": 128000
+    "context_window": 2000000
   },
   "general": {
-    "analysis_bar_count": 100,
+    "analysis_bar_count": 150,
     "refresh_interval_ms": 1000,
     "context_warning_threshold_pct": 80.0,
     "last_data_source": "mt5",
@@ -61,5 +61,59 @@
     "max_open_risk_pct": 1.5,
     "daily_loss_warning_pct": 1.5,
     "weekly_loss_warning_pct": 3.0
+  },
+  "strategy": {
+    "enabled": true,
+    "strategy_id": "cloud_ai_daily_pullback_v1",
+    "parameter_version": "1.0.0",
+    "stock_pool_size": 11,
+    "market_breadth_min_pct": 55.0
+  },
+  "topdown_scoring": {
+    "enabled": true,
+    "strategy_version": "cloud_ai_topdown_4321_intraday_v1",
+    "scoring_version": "1.0.0",
+    "bar_timeframe": "15m",
+    "observe_threshold": 60.0,
+    "pass_threshold": 70.0,
+    "revoke_threshold": 65.0,
+    "consecutive_pass_bars": 2,
+    "minimum_index_score": 24.0,
+    "minimum_sentiment_score": 15.0,
+    "minimum_market_breadth_pct": 40.0,
+    "hotspot_refresh_seconds": 300,
+    "outside_pool_risk_multiplier": 0.5,
+    "max_outside_pool_positions": 1
+  },
+  "portfolio_risk": {
+    "max_positions": 3,
+    "max_new_positions_per_day": 1,
+    "max_position_value_pct": 10.0,
+    "max_sector_open_risk_pct": 0.75,
+    "monthly_warning_loss_pct": 1.0,
+    "monthly_stop_loss_pct": 1.5,
+    "max_quote_age_seconds": 5,
+    "max_quote_deviation_pct": 0.5,
+    "initial_live_trade_count": 30,
+    "initial_per_trade_risk_pct": 0.25,
+    "initial_max_open_risk_pct": 1.0,
+    "live_trading_enabled": false
+  },
+  "ths": {
+    "enabled": false,
+    "read_only": true,
+    "market_executable": "happ.exe",
+    "trading_executable": "xiadan.exe",
+    "install_path": "",
+    "client_version": "",
+    "broker_name": "",
+    "masked_account": "",
+    "account_fingerprint": "",
+    "confirmed": false,
+    "allow_prefill": false,
+    "idle_sync_seconds": 30,
+    "quote_sync_seconds": 2,
+    "max_quote_age_seconds": 5,
+    "max_price_deviation_pct": 0.5
   }
 }

@@ -218,9 +218,7 @@ def tv_forex_auto_probe_plan(symbol: str) -> list[tuple[str, str]]:
         if not ex or ex in TV_EQUITY_EXCHANGES or ex in TV_CRYPTO_EXCHANGES:
             continue
         if sym in _GOLD_TV_SYMBOLS:
-            feed = TV_GOLD_SYMBOL_BY_EXCHANGE.get(ex)
-            if feed is None:
-                continue
+            feed = TV_GOLD_SYMBOL_BY_EXCHANGE.get(ex, sym)
             pair = (ex, feed)
         else:
             pair = (ex, sym)
@@ -240,7 +238,7 @@ def tv_auto_probe_plan(symbol: str) -> list[tuple[str, str]]:
 
 def equity_tv_auto_probe_plan(symbol: str) -> list[tuple[str, str]]:
     """Ordered (exchange, symbol) attempts for auto-detect equity feeds."""
-    from pa_agent.data.tv_symbol_lookup import lookup_tv_symbol_by_name, is_tv_name_input
+    from pa_agent.data.tv_symbol_lookup import is_tv_name_input, lookup_tv_symbol_by_name
 
     # 1. Known index tickers (SPX, NDX, VIX, futures, etc.)
     upper = (symbol or "").strip().upper()
@@ -320,7 +318,6 @@ def resolve_tv_ashare_pair(
         return None
 
     ex_in = (exchange or "").strip().upper()
-    adjusted = False
     if ex_in in ("SH", "SSE", "SHSE", "SHANGHAI"):
         return "SSE", code, ex_in != "SSE"
     if ex_in in ("SZ", "SZSE", "XSHE", "SHENZHEN"):

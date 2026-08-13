@@ -8,14 +8,15 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable
+from typing import Any
 
 from pa_agent.data.eastmoney_client import (
-    EastMoneyTransientError,
     _QUOTE_HOSTS,
     _REFERER_KLINE,
     _UT,
+    EastMoneyTransientError,
     _get_json_on_hosts,
     stock_secid,
 )
@@ -405,6 +406,162 @@ def fetch_board_money_flow(board_code: str) -> dict[str, Any] | None:
         return None
 
 
+def fetch_board_constituent_snapshot(board_code: str) -> dict[str, Any] | None:
+    """Current board breadth and turnover from its structured constituents."""
+    raw = str(board_code).strip().upper()
+    if not raw.startswith("BK"):
+        raw = f"BK{raw.zfill(4)}"
+    params = {
+        "pn": "1",
+        "pz": "100",
+        "po": "1",
+        "np": "1",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": f"b:{raw}",
+        "fields": "f12,f14,f2,f3,f6",
+        "ut": _UT,
+    }
+    try:
+        rows: list[dict[str, Any]] = []
+        total = 0
+        for page in range(1, 21):
+            params["pn"] = str(page)
+            data = _get_json_on_hosts(
+                _QUOTE_HOSTS,
+                "/api/qt/clist/get",
+                params,
+                timeout=10.0,
+                host_kind="quote",
+                referer="https://quote.eastmoney.com/center/boardlist.html",
+                max_rounds=1,
+                max_hosts=2,
+            )
+            payload = data.get("data") or {}
+            page_rows = list(payload.get("diff") or [])
+            total = int(payload.get("total") or total or len(page_rows))
+            rows.extend(page_rows)
+            if not page_rows or len(rows) >= total:
+                break
+        valid = [item for item in rows if item.get("f3") not in (None, "-")]
+        if not valid:
+            return None
+        return {
+            "constituent_count": total or len(valid),
+            "sampled_count": len(valid),
+            "breadth_sample_complete": (total or len(valid)) <= len(valid),
+            "advancing_pct": sum(float(item["f3"]) > 0 for item in valid) / len(valid) * 100,
+            "turnover": sum(float(item.get("f6") or 0) for item in valid),
+        }
+    except EastMoneyTransientError as exc:
+        logger.debug("board constituent snapshot failed %s: %s", board_code, exc)
+        return None
+
+
+_BOARD_PERCENTILE_CACHE: tuple[float, dict[str, float]] = (0.0, {})
+
+
+def fetch_board_relative_strength_percentiles(*, max_age_seconds: int = 300) -> dict[str, float]:
+    """Return current industry/concept price-strength percentiles.
+
+    The cross-section is downloaded page by page because East Money caps a
+    single response at 100 rows even when a larger ``pz`` is requested.
+    Results are cached only for the hotspot refresh interval.
+    """
+    global _BOARD_PERCENTILE_CACHE
+    captured, cached = _BOARD_PERCENTILE_CACHE
+    now = time.monotonic()
+    if cached and now - captured <= max(0, max_age_seconds):
+        return dict(cached)
+    changes: dict[str, float] = {}
+    for fs in ("m:90+t:2+f:!50", "m:90+t:3+f:!50"):
+        total = 0
+        for page in range(1, 21):
+            params = {
+                "pn": str(page), "pz": "100", "po": "1", "np": "1",
+                "fltt": "2", "invt": "2", "fid": "f3", "fs": fs,
+                "fields": "f12,f3", "ut": _UT,
+            }
+            data = _get_json_on_hosts(
+                _QUOTE_HOSTS, "/api/qt/clist/get", params, timeout=10.0,
+                host_kind="quote",
+                referer="https://quote.eastmoney.com/center/boardlist.html",
+                max_rounds=1, max_hosts=2,
+            )
+            payload = data.get("data") or {}
+            rows = list(payload.get("diff") or [])
+            total = int(payload.get("total") or total or len(rows))
+            for row in rows:
+                code = str(row.get("f12") or "").upper()
+                if code and row.get("f3") not in (None, "-"):
+                    changes[code] = float(row["f3"])
+            if not rows or page * 100 >= total:
+                break
+    ordered = sorted(changes.values())
+    if not ordered:
+        return {}
+    count = len(ordered)
+    percentiles = {
+        code: sum(item <= value for item in ordered) / count * 100
+        for code, value in changes.items()
+    }
+    _BOARD_PERCENTILE_CACHE = (now, percentiles)
+    return dict(percentiles)
+
+
+def fetch_board_daily_klines(board_code: str, *, limit: int = 30) -> list[dict[str, Any]]:
+    """Daily board price/turnover rows used for persistence and relative strength."""
+    params = {
+        "secid": _board_secid(board_code),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "ut": _UT,
+        "klt": "101",
+        "fqt": "0",
+        "beg": "0",
+        "end": "20500000",
+        "lmt": str(max(5, min(int(limit), 120))),
+    }
+    try:
+        data = _get_json_on_hosts(
+            _QUOTE_HOSTS,
+            "/api/qt/stock/kline/get",
+            params,
+            timeout=12.0,
+            host_kind="kline",
+            referer="https://quote.eastmoney.com/center/boardlist.html",
+            max_rounds=1,
+            max_hosts=2,
+        )
+        return _parse_board_klines(list((data.get("data") or {}).get("klines") or []))
+    except EastMoneyTransientError as exc:
+        logger.debug("board daily kline failed %s: %s", board_code, exc)
+        return []
+
+
+def _parse_board_klines(lines: list[str]) -> list[dict[str, Any]]:
+    result = []
+    for line in lines:
+        parts = str(line).split(",")
+        if len(parts) < 7:
+            continue
+        try:
+            result.append({
+                "time": parts[0],
+                "open": float(parts[1]),
+                "close": float(parts[2]),
+                "high": float(parts[3]),
+                "low": float(parts[4]),
+                "volume": float(parts[5]),
+                "amount": float(parts[6]),
+                "pct_chg": float(parts[8]) if len(parts) > 8 else None,
+            })
+        except ValueError:
+            continue
+    return result
+
+
 def fetch_stock_board_money_flows(
     symbol: str,
     boards: list[dict[str, Any]] | None = None,
@@ -422,6 +579,7 @@ def fetch_stock_board_money_flows(
         key=lambda b: int(b.get("BOARD_RANK") or 999),
     )
     flows: list[dict[str, Any]] = []
+    relative_strength = fetch_board_relative_strength_percentiles()
     seen: set[str] = set()
     for board in ranked:
         code = str(board.get("BOARD_CODE") or "").strip()
@@ -433,6 +591,31 @@ def fetch_stock_board_money_flows(
             continue
         snap["board_name"] = snap.get("board_name") or board.get("BOARD_NAME")
         snap["board_rank"] = board.get("BOARD_RANK")
+        breadth = fetch_board_constituent_snapshot(code)
+        history = fetch_board_daily_klines(code, limit=30)
+        if breadth and breadth.get("breadth_sample_complete"):
+            snap.update(breadth)
+        if len(history) >= 21:
+            amounts = [float(item.get("amount") or 0) for item in history]
+            recent_mean = sum(amounts[-21:-1]) / 20
+            snap["turnover_vs_recent"] = (
+                amounts[-1] / recent_mean if recent_mean > 0 else 0.0
+            )
+            changes = [float(item.get("pct_chg") or 0) for item in history]
+            persistence = 0
+            for value in reversed(changes):
+                if value <= 0:
+                    break
+                persistence += 1
+            snap["persistence_days"] = persistence
+            closes = [float(item["close"]) for item in history]
+            latest_return = (
+                (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 else 0.0
+            )
+            snap["five_day_return_pct"] = latest_return
+        normalized_code = f"BK{code.upper().replace('BK', '').zfill(4)}"
+        if normalized_code in relative_strength:
+            snap["relative_strength_percentile"] = relative_strength[normalized_code]
         flows.append(snap)
         if len(flows) >= limit:
             break

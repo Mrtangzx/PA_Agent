@@ -16,17 +16,10 @@ This module contains:
 
 from __future__ import annotations
 
-
-
 import logging
-
 import math
-
 from dataclasses import dataclass
-
 from typing import Any
-
-
 
 logger = logging.getLogger(__name__)
 
@@ -1926,7 +1919,6 @@ def route_order_method(
                 "entry_price",
                 "stop_loss_price",
                 "take_profit_price",
-                "take_profit_price_2",
             )
         )
 

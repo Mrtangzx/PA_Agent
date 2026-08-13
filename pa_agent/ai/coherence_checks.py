@@ -425,7 +425,7 @@ def validate_bar_by_bar_vs_features(
     features = {f.seq: f for f in compute_kline_geometry_features(kline_frame)}
     bars = getattr(kline_frame, "bars", None)
     bars_by_seq = (
-        {int(getattr(b, "seq")): b for b in bars if getattr(b, "seq", None)} if bars else {}
+        {int(b.seq): b for b in bars if getattr(b, "seq", None)} if bars else {}
     )
 
     # Threshold bands (prompt-engineering semantics: follow-through and bar-type near
@@ -499,6 +499,15 @@ def validate_bar_by_bar_vs_features(
         # not mutually exclusive. Only flag genuine bull/bear contradictions.
         _ALL_BAR_TYPES = _STRUCTURAL_TYPES | _THRESHOLD_SENSITIVE_TYPES
         if declared in _ALL_BAR_TYPES and computed in _ALL_BAR_TYPES:
+            if (
+                (declared in _STRUCTURAL_TYPES or computed in _STRUCTURAL_TYPES)
+                and (declared, computed) not in _COMPATIBLE_PAIRS
+            ):
+                errors.append(
+                    f"bar_by_bar_summary[{i}].bar_type={declared!r} contradicts "
+                    f"program feature K{seq} bar_type={computed!r}"
+                )
+                continue
             _opposites = (
                 ("trend_bull", "trend_bear"),
                 ("outside_bull", "outside_bear"),
@@ -783,5 +792,4 @@ def validate_incremental_stage1_coherence(
     for item in stage1.get("gate_trace") or []:
         if isinstance(item, dict):
             blob_parts.append(str(item.get("reason", "") or ""))
-    blob = "\n".join(blob_parts)
     return errors

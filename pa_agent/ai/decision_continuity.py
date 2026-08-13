@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -105,12 +105,15 @@ def _parse_local_iso_ms(iso: str | None) -> int | None:
     if raw.endswith("Z"):
         raw = raw[:-1] + "+00:00"
     try:
-        return int(datetime.fromisoformat(raw).timestamp() * 1000)
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return int(parsed.timestamp() * 1000)
     except (TypeError, ValueError, OSError):
         pass
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            return int(datetime.strptime(raw[:19], fmt).timestamp() * 1000)
+            return int(datetime.strptime(raw[:19], fmt).replace(tzinfo=UTC).timestamp() * 1000)
         except (TypeError, ValueError, OSError):
             continue
     return None
@@ -211,13 +214,13 @@ def assess_limit_order_triggered(
         seq = int(getattr(bar, "seq", 0) or 0)
         low = float(getattr(bar, "low", 0))
         high = float(getattr(bar, "high", low))
-        if sign > 0 and low <= entry + tol:
+        if sign > 0 and low - tol <= entry <= high + tol:
             return (
                 True,
                 f"K{seq} low={low} 已触及/跌破限价入场 {entry}（做多限价视为已触发）",
                 seq,
             )
-        if sign < 0 and high >= entry - tol:
+        if sign < 0 and low - tol <= entry <= high + tol:
             return (
                 True,
                 f"K{seq} high={high} 已触及/突破限价入场 {entry}（做空限价视为已触发）",
@@ -326,11 +329,18 @@ def assess_combined_plan_invalidation(
     max_pending_bars: int = DEFAULT_MAX_PENDING_LIMIT_BARS,
 ) -> tuple[bool, str, bool, str, int | None]:
     """Stop-loss, auto-expiry, and regime-change invalidation for a previous plan."""
-    invalidated, invalidation_reason = assess_plan_invalidation(prev_decision, frame)
     limit_triggered, trigger_reason, trigger_bar = assess_limit_order_triggered(
         prev_decision,
         frame,
         max_bars=bars_since,
+    )
+    is_resting_limit = str((prev_decision or {}).get("order_type") or "").strip() == "限价单"
+    # A stop cannot invalidate an entry order that was never filled. Evaluate
+    # stop loss only after this window proves a fill, or for non-limit plans.
+    invalidated, invalidation_reason = (
+        assess_plan_invalidation(prev_decision, frame)
+        if limit_triggered or not is_resting_limit
+        else (False, "")
     )
     invalidated, auto_reason = assess_unfilled_limit_auto_cancel(
         prev_decision=prev_decision,
@@ -521,7 +531,7 @@ def render_continuity_prompt_block(ctx: dict[str, Any]) -> str:
         f">{DEFAULT_MAX_PENDING_LIMIT_BARS} 根 K 线 / 阶段一 `cycle_position` 变化 / "
         "`direction` 变化）→ **不得**写「仍等待上一轮限价/setup」；须按本轮结构重新评估，"
         "可给新方案或明确观望。",
-        f"1. **未失效 + 限价未触发** → 默认 `order_type=不下单`、`terminal.outcome=wait`，"
+        "1. **未失效 + 限价未触发** → 默认 `order_type=不下单`、`terminal.outcome=wait`，"
         "在 watch_points 说明仍等待上一轮限价/setup 触价；"
         "**禁止**立即在相近结构位反手，除非 K1 收盘已触发失效。",
         "2. **未失效 + 限价已触发** → **禁止**写「仍等待限价触发/尚未触价」；"
@@ -694,7 +704,9 @@ def audit_relation_fields(
         prev_decision,
         curr_decision,
         frame=frame,
-        prev_invalidated=invalidated,
+        # Relation describes what the new decision did; invalidation is audited
+        # independently in prev_plan_invalidated.
+        prev_invalidated=False,
         same_structure=same_struct,
     )
     if (

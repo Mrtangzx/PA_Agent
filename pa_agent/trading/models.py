@@ -16,6 +16,14 @@ class AssetClass(StrEnum):
 
 class PlanStatus(StrEnum):
     PROPOSED = "proposed"
+    TRIGGERED = "triggered"
+    AWAITING_USER_CONFIRMATION = "awaiting_user_confirmation"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+    SUBMITTED = "submitted"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
     IGNORED = "ignored"
     EXPIRED = "expired"
     INVALIDATED = "invalidated"
@@ -39,6 +47,14 @@ class TradeEventType(StrEnum):
     MANUAL_ADJUSTMENT = "manual_adjustment"
     QUOTE_UNAVAILABLE = "quote_unavailable"
     PRICE_LIMIT_BLOCKED = "price_limit_blocked"
+    BROKER_SUBMITTED = "broker_submitted"
+    BROKER_PARTIAL_FILL = "broker_partial_fill"
+    BROKER_FILLED = "broker_filled"
+    BROKER_CANCELLED = "broker_cancelled"
+    BROKER_REJECTED = "broker_rejected"
+    AWAITING_USER_CONFIRMATION = "awaiting_user_confirmation"
+    EXTERNAL_MANUAL_TRADE = "external_manual_trade"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
 
 
 class InstrumentProfile(BaseModel):

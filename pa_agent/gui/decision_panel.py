@@ -2,15 +2,6 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from pa_agent.util.trade_metrics import (
-    compute_risk_reward,
-    format_estimated_win_rate,
-    max_risk_reward_ratio,
-    min_risk_reward_ratio,
-    passes_trader_equation,
-)
-from pa_agent.ai.cycle_enums import format_cycle_position, format_cycle_with_direction, format_trend_label
-
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -21,6 +12,19 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+)
+
+from pa_agent.ai.cycle_enums import (
+    format_cycle_position,
+    format_cycle_with_direction,
+    format_trend_label,
+)
+from pa_agent.util.trade_metrics import (
+    compute_risk_reward,
+    format_estimated_win_rate,
+    max_risk_reward_ratio,
+    min_risk_reward_ratio,
+    passes_trader_equation,
 )
 
 _NO_ORDER = "不下单"
@@ -86,7 +90,7 @@ def _format_prediction_probs_line(probs: dict) -> str:
     bull = probs.get("bullish", "?")
     bear = probs.get("bearish", "?")
     neut = probs.get("neutral", "?")
-    return f"阳线的概率为{bull}%  ·  阴线的概率为{bear}%  ·  中性的概率为{neut}%"
+    return f"阳 {bull}% · 阴 {bear}% · 中 {neut}%"
 
 
 def _dominant_prediction_direction(probs: dict) -> str | None:
@@ -181,6 +185,30 @@ class DecisionPanel(QWidget):
         self._diag_reasoning_label.setWordWrap(True)
         self._diag_reasoning_label.setStyleSheet(_REASON_FONT_CSS)
         layout.addWidget(self._diag_reasoning_label)
+
+        # Optional next-bar forecast.  It remains hidden when the feature is
+        # disabled or the validated decision has no prediction payload.
+        self._prediction_group = QFrame()
+        self._prediction_group.setObjectName("predictionGroup")
+        prediction_layout = QVBoxLayout(self._prediction_group)
+        prediction_layout.setContentsMargins(10, 8, 10, 8)
+        prediction_layout.setSpacing(6)
+        prediction_title = QLabel("下一根K线预期")
+        prediction_title.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        self._prediction_direction_label = QLabel()
+        self._prediction_direction_label.setWordWrap(True)
+        self._prediction_reasoning_edit = QTextEdit()
+        self._prediction_reasoning_edit.setReadOnly(True)
+        self._prediction_reasoning_edit.setMaximumHeight(72)
+        self._prediction_reasoning_edit.setStyleSheet(_REASON_EDIT_CSS)
+        prediction_layout.addWidget(prediction_title)
+        prediction_layout.addWidget(self._prediction_direction_label)
+        prediction_layout.addWidget(self._prediction_reasoning_edit)
+        self._prediction_group.setStyleSheet(
+            "QFrame#predictionGroup { background:#161b22; border:1px solid #30363d; "
+            "border-radius:6px; }"
+        )
+        layout.addWidget(self._prediction_group)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -424,6 +452,43 @@ class DecisionPanel(QWidget):
             self._trade_conf_inline_label.setVisible(False)
             self._trade_reasoning_label.setVisible(False)
 
+    def _apply_next_bar_prediction(self, raw: object) -> None:
+        """Render a validated optional forecast without affecting trade logic."""
+        if not isinstance(raw, dict) or not raw:
+            self._prediction_direction_label.clear()
+            self._prediction_reasoning_edit.clear()
+            self._prediction_group.setVisible(False)
+            return
+
+        reasoning = raw.get("reasoning")
+        reasoning_text = reasoning if isinstance(reasoning, str) else ""
+        if raw.get("unpredictable") is True:
+            color = _PREDICTION_UNPREDICTABLE_COLOR
+            line = _PREDICTION_UNPREDICTABLE_LABEL
+        else:
+            probabilities = raw.get("probabilities")
+            if not isinstance(probabilities, dict):
+                self._prediction_direction_label.clear()
+                self._prediction_reasoning_edit.clear()
+                self._prediction_group.setVisible(False)
+                return
+            dominant = _dominant_prediction_direction(probabilities)
+            if dominant is None:
+                self._prediction_direction_label.clear()
+                self._prediction_reasoning_edit.clear()
+                self._prediction_group.setVisible(False)
+                return
+            color = _PREDICTION_DOMINANT_COLOR[dominant]
+            line = _format_prediction_probs_line(probabilities)
+
+        self._prediction_direction_label.setText(line)
+        self._prediction_direction_label.setStyleSheet(
+            f"font-size:14px; font-weight:bold; color:{color};"
+        )
+        self._prediction_reasoning_edit.setPlainText(reasoning_text)
+        self._prediction_reasoning_edit.setVisible(bool(reasoning_text))
+        self._prediction_group.setVisible(True)
+
     def _set_conclusion_bar_style(self) -> None:
         self._conclusion_bar.setStyleSheet(
             "QFrame#conclusionBar {"
@@ -450,6 +515,7 @@ class DecisionPanel(QWidget):
         confidence_threshold: int | None = None,
     ) -> None:
         self._apply_market_diagnosis(diagnosis_summary, stage1_diagnosis)
+        self._apply_next_bar_prediction(decision.get("next_bar_prediction"))
 
         order_type = decision.get("order_type", _NO_ORDER)
         has_trade_plan = order_type != _NO_ORDER
@@ -602,6 +668,10 @@ class DecisionPanel(QWidget):
         self._diag_conf_bar.setVisible(False)
         self._diag_conf_label.setVisible(False)
         self._diag_reasoning_label.setVisible(False)
+
+        self._prediction_direction_label.clear()
+        self._prediction_reasoning_edit.clear()
+        self._prediction_group.setVisible(False)
 
         self._reset_conclusion_bar_side_labels()
         self._conclusion_bar.setVisible(False)

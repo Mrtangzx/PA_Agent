@@ -16,7 +16,7 @@ def _decision(direction: str = "做多", confidence: int = 10) -> dict:
     }
 
 
-def test_low_confidence_decision_is_still_audited_and_shadow_planned(tmp_path) -> None:
+def test_ai_decision_is_audited_but_cannot_create_executable_plan(tmp_path) -> None:
     store = TradeStore(tmp_path / "trades.db")
     service = TradingService(store, RiskSettings())
     result = service.persist_stage2_decision(
@@ -24,7 +24,8 @@ def test_low_confidence_decision_is_still_audited_and_shadow_planned(tmp_path) -
         symbol="600519", timeframe="1d", data_source="akshare", record_meta={},
     )
     assert result["decision_id"]
-    assert result["plan_id"]
+    assert result["plan_id"] is None
+    assert result["execution_blocked_reason"] == "ai_research_only"
     assert result["risk_snapshot"]["quantity"] is None
     metrics = result["final_decision"]["program_trade_metrics"]
     assert metrics["gross_expectancy"] is not None

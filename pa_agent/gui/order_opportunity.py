@@ -125,7 +125,9 @@ def play_order_alert_sound() -> bool:
             try:
                 winsound.PlaySound(
                     path,
-                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                    winsound.SND_FILENAME
+                    | getattr(winsound, "SND_ASYNC", 0)
+                    | winsound.SND_NODEFAULT,
                 )
                 return True
             except Exception as exc:
@@ -135,7 +137,9 @@ def play_order_alert_sound() -> bool:
             try:
                 winsound.PlaySound(
                     alias,
-                    winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                    winsound.SND_ALIAS
+                    | getattr(winsound, "SND_ASYNC", 0)
+                    | winsound.SND_NODEFAULT,
                 )
                 return True
             except Exception as exc:

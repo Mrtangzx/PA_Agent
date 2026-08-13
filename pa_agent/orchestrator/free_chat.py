@@ -7,8 +7,8 @@ Design reference: design.md §B.17
 """
 from __future__ import annotations
 
-import logging
 import json
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
@@ -245,11 +245,13 @@ class FreeChatSession:
             recall_parts.append("【关注点】" + "；".join(watch_points[:3]))
         recall_content = "\n".join(recall_parts)
         if recall_content.strip():
-            prefix.append(
-                {
-                    "role": "assistant",
-                    "content": recall_content,
-                }
+            # Keep the stable prefix to two roles (system + analysis reference).
+            # A synthetic assistant turn breaks conversation ordering and, when
+            # reasoning resend is enabled, looks like an assistant response with
+            # missing reasoning_content.  The same audited facts belong in the
+            # analysis-reference user message instead.
+            prefix[1]["content"] += (
+                "\n\n## 上次分析的程序校验摘要\n\n" + recall_content
             )
 
         return prefix

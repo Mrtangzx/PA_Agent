@@ -8,15 +8,16 @@ import logging
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 
 from pa_agent.trading.models import Execution, InstrumentProfile, TradePlan, TradeResult
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 12
 
 
 def _now() -> str:
@@ -114,9 +115,15 @@ class TradeStore:
                     shadow_mfe REAL NOT NULL DEFAULT 0,
                     shadow_mae REAL NOT NULL DEFAULT 0,
                     shadow_holding_bars INTEGER NOT NULL DEFAULT 0,
+                    shadow_active_stop REAL,
+                    shadow_highest_close REAL,
+                    shadow_time_exit_pending INTEGER NOT NULL DEFAULT 0,
                     actual_mfe REAL NOT NULL DEFAULT 0,
                     actual_mae REAL NOT NULL DEFAULT 0,
                     actual_holding_bars INTEGER NOT NULL DEFAULT 0,
+                    actual_active_stop REAL,
+                    actual_highest_close REAL,
+                    actual_time_exit_pending INTEGER NOT NULL DEFAULT 0,
                     last_price REAL,
                     last_bar_at TEXT,
                     created_at TEXT NOT NULL,
@@ -169,10 +176,192 @@ class TradeStore:
                     confirmed_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS quant_signals (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    parameter_version TEXT NOT NULL,
+                    pool_version TEXT NOT NULL,
+                    signal_time TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    plan_id TEXT REFERENCES trade_plans(id)
+                );
+                CREATE TABLE IF NOT EXISTS strategy_state_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_id TEXT NOT NULL,
+                    previous_state TEXT NOT NULL,
+                    current_state TEXT NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    validation_run_id TEXT NOT NULL DEFAULT '',
+                    approval_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS broker_snapshots (
+                    id TEXT PRIMARY KEY,
+                    account_fingerprint TEXT NOT NULL,
+                    connection_status TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    complete INTEGER NOT NULL DEFAULT 0,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS equity_snapshots (
+                    id TEXT PRIMARY KEY,
+                    account_fingerprint TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    total_equity REAL NOT NULL,
+                    available_cash REAL,
+                    position_value REAL,
+                    external_cash_flow REAL NOT NULL DEFAULT 0,
+                    monthly_return_pct REAL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS broker_cash_flows (
+                    fingerprint TEXT PRIMARY KEY,
+                    account_fingerprint TEXT NOT NULL,
+                    broker_flow_id TEXT NOT NULL DEFAULT '',
+                    direction TEXT NOT NULL CHECK(direction IN ('deposit','withdrawal')),
+                    amount REAL NOT NULL CHECK(amount > 0),
+                    occurred_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'ths_ui',
+                    raw_json TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS broker_cash_flow_syncs (
+                    id TEXT PRIMARY KEY,
+                    account_fingerprint TEXT NOT NULL,
+                    range_start TEXT NOT NULL,
+                    range_end TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    complete INTEGER NOT NULL DEFAULT 0,
+                    row_count INTEGER NOT NULL DEFAULT 0,
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(account_fingerprint,range_start,range_end,captured_at)
+                );
+                CREATE TABLE IF NOT EXISTS broker_order_links (
+                    id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL REFERENCES trade_plans(id),
+                    broker_order_id TEXT NOT NULL,
+                    broker_fill_ids_json TEXT NOT NULL DEFAULT '[]',
+                    match_status TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(plan_id, broker_order_id)
+                );
+                CREATE TABLE IF NOT EXISTS universe_snapshots (
+                    version TEXT PRIMARY KEY,
+                    as_of TEXT NOT NULL,
+                    source_updated_at TEXT NOT NULL DEFAULT '',
+                    data_complete INTEGER NOT NULL DEFAULT 0,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS topdown_score_snapshots (
+                    id TEXT PRIMARY KEY,
+                    strategy_version TEXT NOT NULL,
+                    scoring_version TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    pool_version TEXT NOT NULL,
+                    bar_closed_at TEXT NOT NULL,
+                    total_score REAL,
+                    status TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(strategy_version,symbol,bar_closed_at,input_hash)
+                );
+                CREATE TABLE IF NOT EXISTS hotspot_snapshots (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    frozen_at TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(symbol,frozen_at,source_hash)
+                );
+                CREATE TABLE IF NOT EXISTS market_sentiment_snapshots (
+                    id TEXT PRIMARY KEY,
+                    captured_at TEXT NOT NULL,
+                    source_as_of TEXT NOT NULL DEFAULT '',
+                    data_complete INTEGER NOT NULL DEFAULT 0,
+                    source_hash TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(captured_at,source_hash)
+                );
+                CREATE TABLE IF NOT EXISTS market_daily_prices (
+                    as_of TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY(as_of,symbol)
+                );
+                CREATE TABLE IF NOT EXISTS outside_pool_approvals (
+                    id TEXT PRIMARY KEY,
+                    review_id TEXT NOT NULL,
+                    plan_id TEXT NOT NULL REFERENCES trade_plans(id),
+                    account_fingerprint TEXT NOT NULL,
+                    effective_risk_pct REAL NOT NULL,
+                    valid_until TEXT NOT NULL,
+                    audit_reason TEXT NOT NULL,
+                    approved_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS external_broker_trades (
+                    broker_fill_id TEXT PRIMARY KEY,
+                    account_fingerprint TEXT NOT NULL,
+                    broker_order_id TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    fees REAL NOT NULL DEFAULT 0,
+                    filled_at TEXT NOT NULL,
+                    fill_json TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS strategy_validation_runs (
+                    id TEXT PRIMARY KEY,
+                    strategy_version TEXT NOT NULL,
+                    dataset TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    promotion_eligible INTEGER NOT NULL DEFAULT 0,
+                    input_hash TEXT NOT NULL,
+                    report_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(strategy_version,dataset,input_hash)
+                );
+                CREATE TABLE IF NOT EXISTS lifecycle_processed_bars (
+                    plan_id TEXT NOT NULL REFERENCES trade_plans(id),
+                    timeframe TEXT NOT NULL,
+                    bar_closed_at TEXT NOT NULL,
+                    processed_at TEXT NOT NULL,
+                    PRIMARY KEY(plan_id,timeframe,bar_closed_at)
+                );
                 CREATE INDEX IF NOT EXISTS idx_decision_symbol_time ON decision_events(symbol, created_at);
                 CREATE INDEX IF NOT EXISTS idx_plans_status ON trade_plans(status, shadow_status);
                 CREATE INDEX IF NOT EXISTS idx_events_plan_time ON trade_events(plan_id, event_at);
                 CREATE INDEX IF NOT EXISTS idx_results_dataset ON trade_results(dataset, closed_at);
+                CREATE INDEX IF NOT EXISTS idx_quant_signal_time ON quant_signals(strategy_id, signal_time);
+                CREATE INDEX IF NOT EXISTS idx_broker_snapshot_time ON broker_snapshots(account_fingerprint, captured_at);
+                CREATE INDEX IF NOT EXISTS idx_equity_snapshot_time ON equity_snapshots(account_fingerprint, captured_at);
+                CREATE INDEX IF NOT EXISTS idx_broker_cash_flow_time ON broker_cash_flows(account_fingerprint,occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_broker_cash_flow_sync_time ON broker_cash_flow_syncs(account_fingerprint,captured_at);
+                CREATE INDEX IF NOT EXISTS idx_topdown_symbol_time ON topdown_score_snapshots(strategy_version,symbol,bar_closed_at);
+                CREATE INDEX IF NOT EXISTS idx_hotspot_symbol_time ON hotspot_snapshots(symbol,frozen_at);
+                CREATE INDEX IF NOT EXISTS idx_sentiment_time ON market_sentiment_snapshots(captured_at);
+                CREATE INDEX IF NOT EXISTS idx_market_daily_price_symbol ON market_daily_prices(symbol,as_of);
+                CREATE INDEX IF NOT EXISTS idx_external_broker_time ON external_broker_trades(account_fingerprint,filled_at);
+                CREATE INDEX IF NOT EXISTS idx_validation_strategy_time ON strategy_validation_runs(strategy_version,created_at);
+                CREATE INDEX IF NOT EXISTS idx_lifecycle_bar_time ON lifecycle_processed_bars(timeframe,bar_closed_at);
                 """
             )
             plan_columns = {
@@ -188,6 +377,38 @@ class TradeStore:
                 conn.execute("ALTER TABLE trade_plans ADD COLUMN actual_mae REAL NOT NULL DEFAULT 0")
             if "actual_holding_bars" not in plan_columns:
                 conn.execute("ALTER TABLE trade_plans ADD COLUMN actual_holding_bars INTEGER NOT NULL DEFAULT 0")
+            if "shadow_active_stop" not in plan_columns:
+                conn.execute("ALTER TABLE trade_plans ADD COLUMN shadow_active_stop REAL")
+            if "shadow_highest_close" not in plan_columns:
+                conn.execute("ALTER TABLE trade_plans ADD COLUMN shadow_highest_close REAL")
+            if "shadow_time_exit_pending" not in plan_columns:
+                conn.execute(
+                    "ALTER TABLE trade_plans ADD COLUMN "
+                    "shadow_time_exit_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            if "actual_active_stop" not in plan_columns:
+                conn.execute("ALTER TABLE trade_plans ADD COLUMN actual_active_stop REAL")
+            if "actual_highest_close" not in plan_columns:
+                conn.execute("ALTER TABLE trade_plans ADD COLUMN actual_highest_close REAL")
+            if "actual_time_exit_pending" not in plan_columns:
+                conn.execute(
+                    "ALTER TABLE trade_plans ADD COLUMN "
+                    "actual_time_exit_pending INTEGER NOT NULL DEFAULT 0"
+                )
+            state_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(strategy_state_events)").fetchall()
+            }
+            if "validation_run_id" not in state_columns:
+                conn.execute(
+                    "ALTER TABLE strategy_state_events "
+                    "ADD COLUMN validation_run_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "approval_json" not in state_columns:
+                conn.execute(
+                    "ALTER TABLE strategy_state_events "
+                    "ADD COLUMN approval_json TEXT NOT NULL DEFAULT '{}'"
+                )
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version',?)",
                 (str(SCHEMA_VERSION),),
@@ -195,6 +416,1030 @@ class TradeStore:
 
     def health(self) -> dict[str, Any]:
         return {"available": self.available, "error": self.error, "path": str(self.db_path)}
+
+    def upsert_universe_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        source_updated_at: str = "",
+        data_complete: bool = True,
+    ) -> str:
+        self._require_available()
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        version = str(payload.get("version", ""))
+        if not version:
+            raise ValueError("universe version is required")
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO universe_snapshots(
+                    version,as_of,source_updated_at,data_complete,snapshot_json,created_at
+                ) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(version) DO UPDATE SET
+                    as_of=excluded.as_of,source_updated_at=excluded.source_updated_at,
+                    data_complete=excluded.data_complete,snapshot_json=excluded.snapshot_json""",
+                (
+                    version,
+                    str(payload.get("as_of", "")),
+                    source_updated_at,
+                    int(data_complete),
+                    _json(payload),
+                    _now(),
+                ),
+            )
+        return version
+
+    def list_universe_snapshots(self, *, limit: int = 24) -> list[dict[str, Any]]:
+        self._require_available()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM universe_snapshots ORDER BY as_of DESC, created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = json.loads(item.pop("snapshot_json") or "{}")
+            result.append(item)
+        return result
+
+    def add_topdown_score(self, snapshot: Any) -> str:
+        self._require_available()
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        snapshot_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO topdown_score_snapshots(
+                    id,strategy_version,scoring_version,symbol,pool_version,bar_closed_at,
+                    total_score,status,input_hash,snapshot_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    str(payload.get("strategy_version", "")),
+                    str(payload.get("scoring_version", "")),
+                    str(payload.get("symbol", "")),
+                    str(payload.get("pool_version", "")),
+                    str(payload.get("bar_closed_at", "")),
+                    payload.get("total_score"),
+                    str(payload.get("status", "")),
+                    str(payload.get("input_hash", "")),
+                    _json(payload),
+                    _now(),
+                ),
+            )
+            row = conn.execute(
+                """SELECT id FROM topdown_score_snapshots
+                   WHERE strategy_version=? AND symbol=? AND bar_closed_at=? AND input_hash=?""",
+                (
+                    str(payload.get("strategy_version", "")),
+                    str(payload.get("symbol", "")),
+                    str(payload.get("bar_closed_at", "")),
+                    str(payload.get("input_hash", "")),
+                ),
+            ).fetchone()
+        return str(row[0])
+
+    def add_validation_run(
+        self,
+        report: Any,
+        *,
+        dataset: str,
+        promotion_eligible: bool = False,
+    ) -> str:
+        self._require_available()
+        payload = report.model_dump(mode="json") if hasattr(report, "model_dump") else dict(report)
+        strategy_version = str(payload.get("strategy_version") or "")
+        status = str(payload.get("status") or "")
+        input_hash = str(payload.get("input_hash") or "")
+        if not strategy_version or not status or not input_hash:
+            raise ValueError("validation report requires strategy_version, status and input_hash")
+        if dataset == "fixed_replay" and promotion_eligible:
+            raise ValueError("fixed replay cannot be used for strategy promotion")
+        if promotion_eligible:
+            if dataset not in {"out_of_sample", "shadow"} or status != "complete":
+                raise ValueError(
+                    "promotion evidence must be a complete out_of_sample or shadow run"
+                )
+            performance = payload.get("performance_evidence")
+            if not isinstance(performance, dict) or performance.get("dataset") != dataset:
+                raise ValueError(
+                    "promotion evidence requires matching performance_evidence"
+                )
+        run_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO strategy_validation_runs(
+                    id,strategy_version,dataset,status,promotion_eligible,input_hash,
+                    report_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    strategy_version,
+                    dataset,
+                    status,
+                    int(promotion_eligible),
+                    input_hash,
+                    _json(payload),
+                    _now(),
+                ),
+            )
+            row = conn.execute(
+                """SELECT id FROM strategy_validation_runs
+                   WHERE strategy_version=? AND dataset=? AND input_hash=?""",
+                (strategy_version, dataset, input_hash),
+            ).fetchone()
+        return str(row[0])
+
+    def list_validation_runs(
+        self, *, strategy_version: str = "", limit: int = 100
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE strategy_version=?" if strategy_version else ""
+        params: tuple[Any, ...] = (
+            (strategy_version, limit) if strategy_version else (limit,)
+        )
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM strategy_validation_runs {where}
+                    ORDER BY created_at DESC LIMIT ?""",
+                params,
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["promotion_eligible"] = bool(item["promotion_eligible"])
+            item["report"] = json.loads(item.pop("report_json") or "{}")
+            result.append(item)
+        return result
+
+    def latest_topdown_score(self, symbol: str = "") -> dict[str, Any] | None:
+        self._require_available()
+        where = "WHERE symbol=?" if symbol else ""
+        params: tuple[Any, ...] = (symbol,) if symbol else ()
+        with self._connection() as conn:
+            row = conn.execute(
+                f"""SELECT * FROM topdown_score_snapshots {where}
+                    ORDER BY bar_closed_at DESC,created_at DESC LIMIT 1""",
+                params,
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["snapshot"] = json.loads(result.pop("snapshot_json") or "{}")
+        return result
+
+    def list_topdown_scores(self, *, symbol: str = "", limit: int = 500) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE symbol=?" if symbol else ""
+        params: tuple[Any, ...] = (symbol, limit) if symbol else (limit,)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM topdown_score_snapshots {where}
+                    ORDER BY bar_closed_at DESC LIMIT ?""",
+                params,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = json.loads(item.pop("snapshot_json") or "{}")
+            result.append(item)
+        return result
+
+    def add_hotspot_snapshot(self, snapshot: Any) -> str:
+        self._require_available()
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        snapshot_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO hotspot_snapshots(
+                    id,symbol,frozen_at,source_hash,snapshot_json,created_at
+                ) VALUES(?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    str(payload.get("symbol", "")),
+                    str(payload.get("frozen_at", "")),
+                    str(payload.get("source_hash", "")),
+                    _json(payload),
+                    _now(),
+                ),
+            )
+            row = conn.execute(
+                """SELECT id FROM hotspot_snapshots
+                   WHERE symbol=? AND frozen_at=? AND source_hash=?""",
+                (
+                    str(payload.get("symbol", "")),
+                    str(payload.get("frozen_at", "")),
+                    str(payload.get("source_hash", "")),
+                ),
+            ).fetchone()
+        return str(row[0])
+
+    def latest_hotspot_snapshot(self, symbol: str) -> dict[str, Any] | None:
+        self._require_available()
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM hotspot_snapshots WHERE symbol=?
+                   ORDER BY frozen_at DESC,created_at DESC LIMIT 1""",
+                (symbol,),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["snapshot"] = json.loads(result.pop("snapshot_json") or "{}")
+        return result
+
+    def add_market_sentiment_snapshot(self, snapshot: Any) -> str:
+        self._require_available()
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        snapshot_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO market_sentiment_snapshots(
+                    id,captured_at,source_as_of,data_complete,source_hash,snapshot_json,created_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    str(payload.get("captured_at", "")),
+                    str(payload.get("source_as_of", "")),
+                    int(bool(payload.get("data_complete"))),
+                    str(payload.get("source_hash", "")),
+                    _json(payload),
+                    _now(),
+                ),
+            )
+            row = conn.execute(
+                """SELECT id FROM market_sentiment_snapshots
+                   WHERE captured_at=? AND source_hash=?""",
+                (str(payload.get("captured_at", "")), str(payload.get("source_hash", ""))),
+            ).fetchone()
+        return str(row[0])
+
+    def list_market_sentiment_snapshots(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        self._require_available()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM market_sentiment_snapshots
+                   ORDER BY captured_at DESC,created_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = json.loads(item.pop("snapshot_json") or "{}")
+            result.append(item)
+        return result
+
+    def update_market_daily_prices_and_high_low(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        as_of: str,
+        captured_at: str,
+        lookback_sessions: int = 20,
+    ) -> tuple[int | None, int | None, dict[str, Any]]:
+        """Persist today's full-market prices and compare with prior sessions.
+
+        Today's rows are excluded from the baseline.  Until at least 20 prior
+        dates and 3,000 comparable symbols exist, no counts are returned.
+        """
+        self._require_available()
+        clean = {
+            str(item.get("code") or ""): float(item["price"])
+            for item in rows
+            if str(item.get("code") or "").isdigit()
+            and item.get("price") is not None
+            and float(item["price"]) > 0
+        }
+        with self._write_lock, self._connection() as conn:
+            dates = [
+                str(item[0]) for item in conn.execute(
+                    """SELECT DISTINCT as_of FROM market_daily_prices
+                       WHERE as_of < ? ORDER BY as_of DESC LIMIT ?""",
+                    (as_of, max(1, int(lookback_sessions))),
+                ).fetchall()
+            ]
+            history: dict[str, list[float]] = {}
+            if len(dates) >= lookback_sessions:
+                placeholders = ",".join("?" for _ in dates)
+                for item in conn.execute(
+                    f"""SELECT symbol,price FROM market_daily_prices
+                        WHERE as_of IN ({placeholders})""",
+                    tuple(dates),
+                ).fetchall():
+                    history.setdefault(str(item[0]), []).append(float(item[1]))
+            conn.executemany(
+                """INSERT INTO market_daily_prices(as_of,symbol,price,captured_at)
+                   VALUES(?,?,?,?) ON CONFLICT(as_of,symbol) DO UPDATE SET
+                   price=excluded.price,captured_at=excluded.captured_at""",
+                [(as_of, symbol, price, captured_at) for symbol, price in clean.items()],
+            )
+        comparable = {
+            symbol: values for symbol, values in history.items()
+            if symbol in clean and len(values) >= lookback_sessions
+        }
+        details = {
+            "as_of": as_of,
+            "stored_count": len(clean),
+            "prior_sessions": len(dates),
+            "comparable_count": len(comparable),
+            "lookback_sessions": lookback_sessions,
+        }
+        if len(dates) < lookback_sessions:
+            details["reason"] = "market_price_history_requires_20_prior_sessions"
+            return None, None, details
+        if len(comparable) < 3000:
+            details["reason"] = "market_price_history_coverage_below_3000"
+            return None, None, details
+        new_high = sum(clean[symbol] >= max(values) for symbol, values in comparable.items())
+        new_low = sum(clean[symbol] <= min(values) for symbol, values in comparable.items())
+        return new_high, new_low, details
+
+    def market_daily_price_dates(self, *, limit: int = 30) -> list[str]:
+        """Return the newest distinct full-market snapshot dates."""
+        self._require_available()
+        safe_limit = max(1, int(limit))
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT as_of FROM market_daily_prices
+                   ORDER BY as_of DESC LIMIT ?""",
+                (safe_limit,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def add_outside_pool_approval(
+        self,
+        *,
+        review_id: str,
+        plan_id: str,
+        account_fingerprint: str,
+        effective_risk_pct: float,
+        valid_until: str,
+        audit_reason: str,
+    ) -> str:
+        self._require_available()
+        approval_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO outside_pool_approvals(
+                    id,review_id,plan_id,account_fingerprint,effective_risk_pct,
+                    valid_until,audit_reason,approved_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    approval_id, review_id, plan_id, account_fingerprint,
+                    effective_risk_pct, valid_until, audit_reason, _now(),
+                ),
+            )
+        return approval_id
+
+    def valid_outside_pool_approval(
+        self,
+        *,
+        plan_id: str,
+        account_fingerprint: str,
+        at_time: str | None = None,
+    ) -> dict[str, Any] | None:
+        self._require_available()
+        point = at_time or _now()
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM outside_pool_approvals
+                   WHERE plan_id=? AND account_fingerprint=? AND valid_until>=?
+                   ORDER BY approved_at DESC LIMIT 1""",
+                (plan_id, account_fingerprint, point),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def add_quant_signal(self, decision: Any, *, plan_id: str | None = None) -> str:
+        """Persist a deterministic signal independently from AI decisions."""
+        self._require_available()
+        payload = decision.model_dump(mode="json") if hasattr(decision, "model_dump") else dict(decision)
+        signal_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            identity = (
+                str(payload.get("strategy_id", "")),
+                str(payload.get("parameter_version", "")),
+                str(payload.get("pool_version", "")),
+                str(payload.get("symbol", "")),
+                str(payload.get("signal_time", "")),
+            )
+            existing = conn.execute(
+                """SELECT id FROM quant_signals
+                   WHERE strategy_id=? AND parameter_version=? AND pool_version=?
+                     AND symbol=? AND signal_time=?""",
+                identity,
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
+            conn.execute(
+                """INSERT INTO quant_signals(
+                    id,created_at,symbol,strategy_id,parameter_version,pool_version,
+                    signal_time,status,decision_json,plan_id
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    signal_id, _now(), str(payload.get("symbol", "")),
+                    str(payload.get("strategy_id", "")), str(payload.get("parameter_version", "")),
+                    str(payload.get("pool_version", "")), str(payload.get("signal_time", "")),
+                    str(payload.get("status", "")), _json(payload), plan_id,
+                ),
+            )
+        return signal_id
+
+    def list_quant_signals(self, *, strategy_id: str = "", limit: int = 500) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE strategy_id=?" if strategy_id else ""
+        params: tuple[Any, ...] = (strategy_id, limit) if strategy_id else (limit,)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM quant_signals {where} ORDER BY signal_time DESC LIMIT ?", params
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["decision"] = json.loads(item.pop("decision_json") or "{}")
+            result.append(item)
+        return result
+
+    def record_strategy_transition(
+        self,
+        transition: Any,
+        evidence: Any,
+        *,
+        strategy_id: str,
+        validation_run_id: str = "",
+        live_approval: Any | None = None,
+    ) -> int:
+        self._require_available()
+        transition_data = transition.model_dump(mode="json") if hasattr(transition, "model_dump") else dict(transition)
+        evidence_data = evidence.model_dump(mode="json") if hasattr(evidence, "model_dump") else dict(evidence)
+        approval_data = (
+            live_approval.model_dump(mode="json")
+            if hasattr(live_approval, "model_dump")
+            else dict(live_approval or {})
+        )
+        previous_state = str(transition_data.get("previous", ""))
+        current_state = str(transition_data.get("current", ""))
+        promotion = (previous_state, current_state) in {
+            ("candidate", "shadow"),
+            ("shadow", "active"),
+        }
+        with self._write_lock, self._connection() as conn:
+            latest = conn.execute(
+                """SELECT current_state FROM strategy_state_events
+                   WHERE strategy_id=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+                (strategy_id,),
+            ).fetchone()
+            stored_state = str(latest[0]) if latest else "candidate"
+            if previous_state != stored_state:
+                raise ValueError(
+                    "strategy transition previous state does not match stored state"
+                )
+            allowed_edges = {
+                "candidate": {"candidate", "shadow"},
+                "shadow": {"shadow", "active", "paused", "retired"},
+                "active": {"active", "reduced", "paused", "retired"},
+                "reduced": {"reduced", "paused", "retired"},
+                "paused": {"paused", "shadow", "retired"},
+                "retired": {"retired"},
+            }
+            if current_state not in allowed_edges.get(previous_state, set()):
+                raise ValueError(
+                    f"invalid strategy state transition: {previous_state}->{current_state}"
+                )
+            if promotion:
+                validation = conn.execute(
+                    """SELECT strategy_version,dataset,status,promotion_eligible,report_json
+                       FROM strategy_validation_runs WHERE id=?""",
+                    (validation_run_id,),
+                ).fetchone()
+                expected_dataset = (
+                    "out_of_sample" if current_state == "shadow" else "shadow"
+                )
+                if (
+                    validation is None
+                    or str(validation["strategy_version"]) != strategy_id
+                    or str(validation["dataset"]) != expected_dataset
+                    or str(validation["status"]) != "complete"
+                    or not bool(validation["promotion_eligible"])
+                ):
+                    raise ValueError(
+                        "strategy promotion requires matching complete "
+                        "promotion-eligible validation evidence"
+                    )
+                stored_evidence = json.loads(validation["report_json"] or "{}").get(
+                    "performance_evidence"
+                )
+                if stored_evidence != evidence_data:
+                    raise ValueError(
+                        "strategy transition evidence does not match validation report"
+                    )
+            if current_state == "active":
+                required = {
+                    "approved_at",
+                    "account_fingerprint",
+                    "initial_risk_pct",
+                    "acknowledgment_version",
+                }
+                if not required.issubset(approval_data):
+                    raise ValueError(
+                        "active strategy transition requires explicit live activation approval"
+                    )
+            cursor = conn.execute(
+                """INSERT INTO strategy_state_events(
+                    strategy_id,previous_state,current_state,reasons_json,evidence_json,
+                    validation_run_id,approval_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    strategy_id,
+                    previous_state,
+                    current_state,
+                    _json(transition_data.get("reasons", [])),
+                    _json(evidence_data),
+                    validation_run_id,
+                    _json(approval_data),
+                    _now(),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def list_strategy_transitions(
+        self, *, strategy_id: str = "", limit: int = 100
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE strategy_id=?" if strategy_id else ""
+        params: tuple[Any, ...] = (
+            (strategy_id, limit) if strategy_id else (limit,)
+        )
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM strategy_state_events {where}
+                    ORDER BY created_at DESC,id DESC LIMIT ?""",
+                params,
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["reasons"] = json.loads(item.pop("reasons_json") or "[]")
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+            item["approval"] = json.loads(item.pop("approval_json") or "{}")
+            result.append(item)
+        return result
+
+    def current_strategy_state(self, strategy_id: str, *, default: str = "candidate") -> str:
+        self._require_available()
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT current_state FROM strategy_state_events
+                   WHERE strategy_id=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+                (strategy_id,),
+            ).fetchone()
+        return str(row[0]) if row else default
+
+    def add_broker_snapshot(self, snapshot: Any) -> str:
+        self._require_available()
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        snapshot_id = uuid.uuid4().hex
+        connection = payload.get("connection") or {}
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO broker_snapshots(
+                    id,account_fingerprint,connection_status,captured_at,complete,snapshot_json,created_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id, str(payload.get("account_fingerprint", "")),
+                    str(connection.get("status", "")), str(payload.get("captured_at", _now())),
+                    int(bool(payload.get("complete"))), _json(payload), _now(),
+                ),
+            )
+        return snapshot_id
+
+    def latest_broker_snapshot(self, account_fingerprint: str = "") -> dict[str, Any] | None:
+        self._require_available()
+        where = "WHERE account_fingerprint=?" if account_fingerprint else ""
+        params: tuple[Any, ...] = (account_fingerprint,) if account_fingerprint else ()
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT * FROM broker_snapshots {where} ORDER BY captured_at DESC LIMIT 1", params
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["snapshot"] = json.loads(result.pop("snapshot_json") or "{}")
+        return result
+
+    def add_equity_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        external_cash_flow: float = 0.0,
+        monthly_return_pct: float | None = None,
+    ) -> str:
+        self._require_available()
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        if payload.get("total_equity") is None:
+            raise ValueError("complete total equity required")
+        snapshot_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO equity_snapshots(
+                    id,account_fingerprint,captured_at,total_equity,available_cash,position_value,
+                    external_cash_flow,monthly_return_pct,snapshot_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id, str(payload.get("account_fingerprint", "")),
+                    str(payload.get("captured_at", _now())), float(payload["total_equity"]),
+                    payload.get("available_cash"), payload.get("position_value"),
+                    external_cash_flow, monthly_return_pct, _json(payload), _now(),
+                ),
+            )
+        return snapshot_id
+
+    @staticmethod
+    def _cash_flow_fingerprint(account_fingerprint: str, payload: dict[str, Any]) -> str:
+        canonical = "|".join((
+            account_fingerprint.strip(),
+            str(payload.get("occurred_at") or "").strip(),
+            str(payload.get("direction") or "").strip().lower(),
+            f"{float(payload.get('amount') or 0):.8f}",
+            str(payload.get("description") or "").strip(),
+        ))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def upsert_broker_cash_flows(
+        self,
+        account_fingerprint: str,
+        cash_flows: list[Any],
+        *,
+        captured_at: str,
+        range_start: str,
+        range_end: str,
+        complete: bool,
+        warnings: list[str] | None = None,
+    ) -> list[str]:
+        """Persist one explicitly bounded broker cash-flow query, including empty results."""
+        self._require_available()
+        account = account_fingerprint.strip()
+        if not account:
+            raise ValueError("account fingerprint is required for broker cash flows")
+        captured = datetime.fromisoformat(captured_at)
+        start = datetime.fromisoformat(range_start)
+        end = datetime.fromisoformat(range_end)
+        if start > end or end > captured:
+            raise ValueError("invalid broker cash-flow query range")
+        payloads: list[dict[str, Any]] = []
+        fingerprints: list[str] = []
+        for flow in cash_flows:
+            payload = flow.model_dump(mode="json") if hasattr(flow, "model_dump") else dict(flow)
+            direction = str(payload.get("direction") or "").strip().lower()
+            amount = float(payload.get("amount") or 0)
+            occurred_at = str(payload.get("occurred_at") or "").strip()
+            if direction not in {"deposit", "withdrawal"}:
+                raise ValueError("broker cash-flow direction must be deposit or withdrawal")
+            if amount <= 0:
+                raise ValueError("broker cash-flow amount must be positive")
+            occurred = datetime.fromisoformat(occurred_at)
+            if occurred < start or occurred > end:
+                raise ValueError("broker cash flow is outside the declared query range")
+            payload["direction"] = direction
+            payload["amount"] = amount
+            payload["occurred_at"] = occurred_at
+            payloads.append(payload)
+            fingerprints.append(self._cash_flow_fingerprint(account, payload))
+
+        sync_id = uuid.uuid4().hex
+        seen_at = _now()
+        with self._write_lock, self._connection() as conn:
+            for fingerprint, payload in zip(fingerprints, payloads, strict=True):
+                conn.execute(
+                    """INSERT INTO broker_cash_flows(
+                        fingerprint,account_fingerprint,broker_flow_id,direction,amount,
+                        occurred_at,status,description,source,raw_json,first_seen_at,last_seen_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(fingerprint) DO UPDATE SET
+                        status=excluded.status,source=excluded.source,raw_json=excluded.raw_json,
+                        last_seen_at=excluded.last_seen_at""",
+                    (
+                        fingerprint, account, str(payload.get("broker_flow_id") or ""),
+                        payload["direction"], payload["amount"], payload["occurred_at"],
+                        str(payload.get("status") or "confirmed"),
+                        str(payload.get("description") or ""),
+                        str(payload.get("source") or "ths_ui"), _json(payload), seen_at, seen_at,
+                    ),
+                )
+            conn.execute(
+                """INSERT INTO broker_cash_flow_syncs(
+                    id,account_fingerprint,range_start,range_end,captured_at,complete,
+                    row_count,warnings_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(account_fingerprint,range_start,range_end,captured_at) DO UPDATE SET
+                    complete=excluded.complete,row_count=excluded.row_count,
+                    warnings_json=excluded.warnings_json""",
+                (
+                    sync_id, account, range_start, range_end, captured_at, int(complete),
+                    len(payloads), _json(warnings or []), seen_at,
+                ),
+            )
+        return fingerprints
+
+    def list_broker_cash_flows(
+        self,
+        *,
+        account_fingerprint: str = "",
+        start_at: str = "",
+        end_at: str = "",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        clauses: list[str] = []
+        values: list[Any] = []
+        if account_fingerprint:
+            clauses.append("account_fingerprint=?")
+            values.append(account_fingerprint)
+        if start_at:
+            clauses.append("occurred_at>=?")
+            values.append(start_at)
+        if end_at:
+            clauses.append("occurred_at<=?")
+            values.append(end_at)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(limit)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM broker_cash_flows {where} ORDER BY occurred_at LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["raw"] = json.loads(item.pop("raw_json") or "{}")
+            result.append(item)
+        return result
+
+    def list_broker_cash_flow_syncs(
+        self, *, account_fingerprint: str = "", limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE account_fingerprint=?" if account_fingerprint else ""
+        params: tuple[Any, ...] = (
+            (account_fingerprint, limit) if account_fingerprint else (limit,)
+        )
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM broker_cash_flow_syncs {where} ORDER BY captured_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["warnings"] = json.loads(item.pop("warnings_json") or "[]")
+            result.append(item)
+        return result
+
+    def cash_flow_between(
+        self, account_fingerprint: str, *, after: str, through: str
+    ) -> float:
+        """Return signed confirmed external flow for ``after < occurred_at <= through``."""
+        self._require_available()
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT COALESCE(SUM(CASE direction
+                       WHEN 'deposit' THEN amount ELSE -amount END),0)
+                   FROM broker_cash_flows
+                   WHERE account_fingerprint=? AND occurred_at>? AND occurred_at<=?
+                     AND lower(status) IN ('confirmed','success','successful','已成','成功','已确认')""",
+                (account_fingerprint, after, through),
+            ).fetchone()
+        return float(row[0] or 0)
+
+    def cash_flow_history_complete(
+        self, account_fingerprint: str, *, range_start: str, range_end: str
+    ) -> bool:
+        """Prove that one successful broker query covers the required interval."""
+        required_start = datetime.fromisoformat(range_start)
+        required_end = datetime.fromisoformat(range_end)
+        for item in self.list_broker_cash_flow_syncs(
+            account_fingerprint=account_fingerprint
+        ):
+            if not item.get("complete"):
+                continue
+            start = datetime.fromisoformat(str(item["range_start"]))
+            end = datetime.fromisoformat(str(item["range_end"]))
+            if start <= required_start and end >= required_end:
+                return True
+        return False
+
+    def record_broker_financial_snapshot(self, snapshot: Any) -> str:
+        """Persist flows first, then attach exactly-once interval flow to equity."""
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        account = str(payload.get("account_fingerprint") or "")
+        captured_at = str(payload.get("captured_at") or "")
+        range_start = str(payload.get("cash_flow_range_start") or "")
+        range_end = str(payload.get("cash_flow_range_end") or "")
+        if range_start and range_end:
+            self.upsert_broker_cash_flows(
+                account,
+                list(payload.get("cash_flows") or []),
+                captured_at=captured_at,
+                range_start=range_start,
+                range_end=range_end,
+                complete=bool(payload.get("cash_flow_complete")),
+                warnings=list(payload.get("warnings") or []),
+            )
+        if payload.get("total_equity") is None:
+            raise ValueError("complete total equity required")
+        with self._connection() as conn:
+            previous = conn.execute(
+                """SELECT captured_at FROM equity_snapshots
+                   WHERE account_fingerprint=? AND captured_at<?
+                   ORDER BY captured_at DESC LIMIT 1""",
+                (account, captured_at),
+            ).fetchone()
+        external_flow = (
+            self.cash_flow_between(account, after=str(previous[0]), through=captured_at)
+            if previous else 0.0
+        )
+        with self._write_lock, self._connection() as conn:
+            existing = conn.execute(
+                """SELECT id FROM equity_snapshots
+                   WHERE account_fingerprint=? AND captured_at=? LIMIT 1""",
+                (account, captured_at),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE equity_snapshots SET total_equity=?,available_cash=?,
+                       position_value=?,external_cash_flow=?,snapshot_json=? WHERE id=?""",
+                    (
+                        float(payload["total_equity"]), payload.get("available_cash"),
+                        payload.get("position_value"), external_flow, _json(payload), existing[0],
+                    ),
+                )
+                return str(existing[0])
+        return self.add_equity_snapshot(snapshot, external_cash_flow=external_flow)
+
+    def list_equity_snapshots(
+        self, *, account_fingerprint: str = "", limit: int = 2000
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE account_fingerprint=?" if account_fingerprint else ""
+        params: tuple[Any, ...] = (
+            (account_fingerprint, limit) if account_fingerprint else (limit,)
+        )
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM equity_snapshots {where} ORDER BY captured_at LIMIT ?", params
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = json.loads(item.pop("snapshot_json") or "{}")
+            result.append(item)
+        return result
+
+    def link_broker_order(self, reconciliation: Any, *, details: dict[str, Any] | None = None) -> str:
+        self._require_available()
+        payload = reconciliation.model_dump(mode="json") if hasattr(reconciliation, "model_dump") else dict(reconciliation)
+        orders = list(payload.get("matched_order_ids") or [])
+        if len(orders) != 1:
+            raise ValueError("a unique broker order is required")
+        link_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO broker_order_links(
+                    id,plan_id,broker_order_id,broker_fill_ids_json,match_status,details_json,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(plan_id,broker_order_id) DO UPDATE SET
+                    broker_fill_ids_json=excluded.broker_fill_ids_json,
+                    match_status=excluded.match_status,details_json=excluded.details_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    link_id, str(payload.get("plan_id", "")), orders[0],
+                    _json(payload.get("matched_fill_ids", [])), str(payload.get("status", "")),
+                    _json(details or {}), _now(), _now(),
+                ),
+            )
+        return link_id
+
+    def list_broker_order_links(self) -> list[dict[str, Any]]:
+        """Return decoded broker links used to prevent duplicate/manual fill attribution."""
+        self._require_available()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM broker_order_links ORDER BY updated_at DESC"
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["broker_fill_ids"] = json.loads(item.pop("broker_fill_ids_json") or "[]")
+            item["details"] = json.loads(item.pop("details_json") or "{}")
+            result.append(item)
+        return result
+
+    def linked_broker_fill_ids(self) -> set[str]:
+        return {
+            str(fill_id)
+            for link in self.list_broker_order_links()
+            for fill_id in link.get("broker_fill_ids", [])
+            if fill_id
+        }
+
+    def add_external_broker_trade(self, fill: Any, *, account_fingerprint: str) -> bool:
+        """Persist an unmatched TongHuaShun fill without assigning it to a strategy plan."""
+        self._require_available()
+        payload = fill.model_dump(mode="json") if hasattr(fill, "model_dump") else dict(fill)
+        fill_id = str(payload.get("broker_fill_id", ""))
+        if not fill_id:
+            raise ValueError("external broker fill id is required")
+        with self._write_lock, self._connection() as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO external_broker_trades(
+                    broker_fill_id,account_fingerprint,broker_order_id,symbol,direction,price,
+                    quantity,fees,filled_at,fill_json,first_seen_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    fill_id, account_fingerprint, str(payload.get("broker_order_id", "")),
+                    str(payload.get("symbol", "")), str(payload.get("direction", "")),
+                    float(payload.get("price") or 0), int(payload.get("quantity") or 0),
+                    float(payload.get("fees") or 0), str(payload.get("filled_at", "")),
+                    _json(payload), _now(),
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def list_external_broker_trades(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        self._require_available()
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM external_broker_trades ORDER BY filled_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [{**dict(row), "fill": json.loads(row["fill_json"])} for row in rows]
+
+    def upsert_broker_execution(
+        self,
+        *,
+        plan_id: str,
+        fills: list[Any],
+        plan_status: str,
+        event_type: str,
+        broker_order_id: str,
+    ) -> None:
+        """Apply real broker fills idempotently; broker data remains the source of truth."""
+        self._require_available()
+        payloads = [
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+            for item in fills
+        ]
+        quantity = sum(float(item.get("quantity") or 0) for item in payloads)
+        total_value = sum(
+            float(item.get("price") or 0) * float(item.get("quantity") or 0)
+            for item in payloads
+        )
+        fees = sum(float(item.get("fees") or 0) for item in payloads)
+        executed_at = max(
+            (str(item.get("filled_at") or "") for item in payloads), default=_now()
+        ) or _now()
+        execution_id = f"broker-{plan_id}"
+        with self._write_lock, self._connection() as conn:
+            plan = conn.execute("SELECT id FROM trade_plans WHERE id=?", (plan_id,)).fetchone()
+            if plan is None:
+                raise ValueError("trade plan not found")
+            if quantity > 0:
+                average_price = total_value / quantity
+                conn.execute(
+                    """INSERT INTO executions(
+                        id,plan_id,executed_at,price,quantity,real_contract,fees,note,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET executed_at=excluded.executed_at,
+                        price=excluded.price,quantity=excluded.quantity,fees=excluded.fees,
+                        note=excluded.note""",
+                    (
+                        execution_id, plan_id, executed_at, average_price, quantity, "", fees,
+                        f"同花顺真实成交；委托 {broker_order_id}", _now(),
+                    ),
+                )
+            conn.execute(
+                "UPDATE trade_plans SET status=?,updated_at=? WHERE id=?",
+                (plan_status, _now(), plan_id),
+            )
+            previous = conn.execute(
+                """SELECT details_json FROM trade_events WHERE plan_id=? AND event_type=?
+                   ORDER BY id DESC LIMIT 1""",
+                (plan_id, event_type),
+            ).fetchone()
+            details = {
+                "broker_order_id": broker_order_id,
+                "broker_fill_ids": [item.get("broker_fill_id") for item in payloads],
+                "quantity": quantity,
+                "fees": fees,
+            }
+            if previous is None or json.loads(previous[0] or "{}") != details:
+                conn.execute(
+                    """INSERT INTO trade_events(
+                        plan_id,event_type,event_at,dataset,price,details_json
+                    ) VALUES(?,?,?,?,?,?)""",
+                    (
+                        plan_id, event_type, executed_at, "actual",
+                        (total_value / quantity if quantity else None), _json(details),
+                    ),
+                )
 
     def add_decision(
         self,
@@ -274,13 +1519,29 @@ class TradeStore:
             )
             return int(cur.lastrowid)
 
+    def claim_lifecycle_bar(
+        self, *, plan_id: str, timeframe: str, bar_closed_at: str
+    ) -> bool:
+        """Atomically claim one closed bar so restarts cannot process it twice."""
+        self._require_available()
+        with self._write_lock, self._connection() as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO lifecycle_processed_bars(
+                    plan_id,timeframe,bar_closed_at,processed_at
+                ) VALUES(?,?,?,?)""",
+                (plan_id, timeframe, bar_closed_at, _now()),
+            )
+        return cursor.rowcount > 0
+
     def update_plan(self, plan_id: str, **fields: Any) -> None:
         self._require_available()
         allowed = {
             "status", "shadow_status", "shadow_entry_price", "shadow_opened_at",
             "shadow_mfe", "shadow_mae", "shadow_holding_bars", "risk_snapshot_json",
+            "shadow_active_stop", "shadow_highest_close", "shadow_time_exit_pending",
             "valid_until", "last_price", "last_bar_at",
             "actual_mfe", "actual_mae", "actual_holding_bars",
+            "actual_active_stop", "actual_highest_close", "actual_time_exit_pending",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:
@@ -316,7 +1577,7 @@ class TradeStore:
         if lifecycle_open:
             where.append(
                 "(shadow_status IN ('proposed','entry_touched','open','exit_detected') "
-                "OR status IN ('executed_open','exit_detected'))"
+                "OR status IN ('partially_filled','executed_open','exit_detected'))"
             )
         if symbol:
             where.append("symbol=?")

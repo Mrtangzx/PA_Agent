@@ -75,16 +75,39 @@ def apply_cursor_provider_to_settings(
     Returns None on success, or a user-facing error string.
     """
     model_hint = (preferred_model or getattr(settings.provider, "model", "") or "").strip()
+    if not is_openclaw_cs_model(model_hint):
+        return "Cursor 路由模型必须为 openclaw_cs 或 openclaw_cs/<modelId>。"
     provider = settings.provider
-    provider.backend = "cursor_sdk"
-    # Preserve whatever the user typed as the alias (openclaw_cs or openclaw_cs/<id>)
-    provider.model = model_hint or _CURSOR_MODEL
-    # Cursor SDK doesn't use base_url; clear it to avoid implying an OpenAI endpoint.
-    provider.base_url = ""
-
     key = str(getattr(provider, "api_key", "") or "").strip()
+    if key.startswith("crsr_"):
+        provider.backend = "cursor_sdk"
+        provider.model = model_hint
+        provider.base_url = ""
+        return None
+
+    # Backward-compatible local QClaw route.  This branch intentionally ignores
+    # user-entered OpenAI URLs/keys and uses the detected gateway fingerprint.
+    # A blank key remains an explicit configuration error, preventing a bare
+    # alias from silently changing provider authority.
     if not key:
-        return "Cursor 路由需要 API Key（形如 crsr_...）。请在设置里填写 API Key。"
-    if not key.startswith("crsr_"):
-        logger.warning("Cursor API key does not start with crsr_: %s", key[:8])
+        return "Cursor 路由需要 crsr_ API Key，或先配置本地 QClaw Gateway。"
+    from pa_agent.ai.qclaw_connector import (
+        detect_qclaw,
+        qclaw_health_check_base,
+        qclaw_provider_settings,
+    )
+
+    if not detect_qclaw():
+        return "Cursor API Key 必须以 crsr_ 开头，且未检测到可用的 QClaw Gateway。"
+    resolved = qclaw_provider_settings(model=model_hint)
+    if resolved is None:
+        return "QClaw 配置读取失败。"
+    provider.backend = "openai_compatible"
+    provider.model = resolved.model
+    provider.base_url = resolved.base_url
+    provider.api_key = resolved.api_key
+    provider.context_window = resolved.context_window
+    ok, message = qclaw_health_check_base(provider.base_url, provider.api_key)
+    if not ok:
+        return f"QClaw 连通性检查失败：\n\n{message}"
     return None

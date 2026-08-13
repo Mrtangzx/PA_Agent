@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +123,7 @@ def _prioritize_primary_host(
     """Always try the reachable delay mirror first (rotation must not skip it)."""
     if primary not in hosts:
         return hosts
-    return (primary,) + tuple(h for h in hosts if h != primary)
+    return (primary, *(host for host in hosts if host != primary))
 
 
 def is_transient_http_error(exc: BaseException) -> bool:
@@ -138,7 +140,10 @@ class EastMoneyTransientError(EastMoneyError):
 
 
 def stock_market_code(symbol: str) -> int:
-    """1 = Shanghai (6/9), 0 = Shenzhen."""
+    """East Money market id: 1=Shanghai, 0=Shenzhen, 0=Beijing compatibility."""
+    # East Money's quote/K-line API currently routes Beijing A shares through
+    # market id 0 as well. Keep this explicit so 8/43/92 codes are not treated
+    # as Shanghai by a broad numeric-prefix rule.
     return 1 if symbol[:1] in ("6", "9") else 0
 
 
@@ -336,15 +341,11 @@ def _parse_klines(raw: list[str]) -> list[dict[str, Any]]:
             "pct_chg": None,
         }
         if len(parts) > 6 and parts[6].strip():
-            try:
+            with suppress(ValueError):
                 row["amount"] = float(parts[6])
-            except ValueError:
-                pass
         if len(parts) > 8 and parts[8].strip():
-            try:
+            with suppress(ValueError):
                 row["pct_chg"] = float(parts[8])
-            except ValueError:
-                pass
         rows.append(row)
     return rows
 
@@ -854,7 +855,7 @@ def fetch_stock_tick_details(
     tail: int = 40,
 ) -> list:
     """当日逐笔成交（``/api/qt/stock/details/get``）。"""
-    from pa_agent.data.eastmoney_quote import TickTrade, parse_tick_lines
+    from pa_agent.data.eastmoney_quote import parse_tick_lines
 
     code = symbol[-6:] if len(symbol) > 6 else symbol
     params = {
@@ -920,3 +921,38 @@ def fetch_stock_quote(symbol: str) -> dict[str, Any] | None:
     if price_raw is not None:
         result["price"] = float(price_raw)
     return result
+
+
+def fetch_stock_listing_profile(symbol: str) -> dict[str, Any] | None:
+    """Return stable identity fields needed by current-universe eligibility checks."""
+    code = symbol[-6:] if len(symbol) > 6 else symbol
+    params = {
+        "fltt": "2",
+        "invt": "2",
+        "ut": _UT,
+        "wbp2u": _WBP2U,
+        "secid": stock_secid(code),
+        "fields": "f57,f58,f127,f189",
+    }
+    try:
+        data = _get_json_on_hosts(
+            _QUOTE_HOSTS,
+            "/api/qt/stock/get",
+            params,
+            timeout=8.0,
+            host_kind="quote",
+            referer=_REFERER_KLINE,
+            max_rounds=1,
+            max_hosts=3,
+        )
+    except EastMoneyTransientError:
+        return None
+    payload = data.get("data") or {}
+    if not payload:
+        return None
+    return {
+        "symbol": str(payload.get("f57") or code),
+        "name": str(payload.get("f58") or code),
+        "industry": str(payload.get("f127") or ""),
+        "listing_date": str(payload.get("f189") or ""),
+    }

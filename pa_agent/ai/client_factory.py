@@ -21,7 +21,12 @@ def create_ai_client(
         log.info("AI client route: Codex SDK (model=%s)", settings.model)
         return CodexSdkClient(settings=settings, logger_=log)
 
-    if settings.backend == "cursor_sdk" or is_openclaw_cs_model(settings.model):
+    direct_cursor_alias = (
+        is_openclaw_cs_model(settings.model)
+        and not (settings.base_url or "").strip()
+        and (settings.api_key or "").strip().startswith("crsr_")
+    )
+    if settings.backend == "cursor_sdk" or direct_cursor_alias:
         from pa_agent.ai.cursor_sdk_client import CursorSdkClient
 
         log.info("AI client route: Cursor SDK (model=%s)", settings.model)

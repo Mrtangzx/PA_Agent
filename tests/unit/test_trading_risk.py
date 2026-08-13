@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pa_agent.trading.models import AssetClass, InstrumentProfile, RiskSettings
+from pa_agent.trading.profiles import default_profile
 from pa_agent.trading.risk import calculate_position_size
 
 
@@ -39,3 +40,11 @@ def test_futures_uses_multiplier_and_margin() -> None:
     )
     assert result["quantity"] > 0
     assert result["planned_risk"] <= 5_000
+
+
+def test_beijing_exchange_profile_uses_thirty_percent_limit_type() -> None:
+    profile = default_profile("839494", "eastmoney", "qfq")
+
+    assert profile.asset_class is AssetClass.A_SHARE
+    assert profile.price_limit_type == "30%"
+    assert profile.board_lot == 100

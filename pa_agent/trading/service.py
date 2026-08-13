@@ -16,9 +16,16 @@ _ORDER_TYPES = {"限价单", "突破单", "市价单", "limit", "stop", "market"
 
 
 class TradingService:
-    def __init__(self, store: TradeStore, risk_settings: RiskSettings | None = None) -> None:
+    def __init__(
+        self,
+        store: TradeStore,
+        risk_settings: RiskSettings | None = None,
+        *,
+        research_only: bool = True,
+    ) -> None:
         self.store = store
         self.risk_settings = risk_settings or RiskSettings()
+        self.research_only = research_only
 
     def persist_stage2_decision(
         self,
@@ -85,6 +92,9 @@ class TradingService:
             "decision_id": decision_id, "final_decision": final, "plan_id": None,
             "risk_snapshot": risk_snapshot,
         }
+        if self.research_only:
+            response["execution_blocked_reason"] = "ai_research_only"
+            return response
         if not actionable or prices is None:
             return response
 

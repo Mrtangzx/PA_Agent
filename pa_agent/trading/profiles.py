@@ -37,6 +37,8 @@ def futures_product_code(symbol: str) -> str:
 def default_profile(symbol: str, data_source: str = "", adjustment_mode: str = "") -> InstrumentProfile:
     asset = infer_asset_class(symbol, data_source)
     if asset is AssetClass.A_SHARE:
+        code = "".join(char for char in symbol if char.isdigit())[-6:]
+        is_beijing = code.startswith(("8", "43", "92"))
         return InstrumentProfile(
             asset_class=asset,
             symbol=symbol,
@@ -44,6 +46,9 @@ def default_profile(symbol: str, data_source: str = "", adjustment_mode: str = "
             allow_short=False,
             board_lot=100,
             t_plus_one=True,
+            price_limit_type="30%" if is_beijing else (
+                "20%" if code.startswith(("300", "301", "688", "689")) else "10%"
+            ),
             adjustment_mode=adjustment_mode if adjustment_mode in {"qfq", "hfq", "none"} else "",
         )
     if asset is AssetClass.CN_FUTURES:

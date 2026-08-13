@@ -5,27 +5,27 @@ import logging
 import sys
 from typing import Any
 
-from PyQt6.QtCore import QThread, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QAction, QCloseEvent, QShowEvent
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut, QShowEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
     QMenuBar,
     QMessageBox,
-    QInputDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import Qt
 
 from pa_agent.ai.response_extract import reasoning_from_response
 from pa_agent.app_context import AppContext
@@ -250,6 +250,10 @@ class MainWindow(QMainWindow):
         )
         self.resize(1440, 900)
         self._ctx = ctx
+        if self._ctx.settings is None:
+            from pa_agent.config.settings import Settings
+
+            self._ctx.settings = Settings()
         self._worker: _AnalysisWorker | None = None
         self._analysis_worker_id: object | None = None
         self._prep_worker: Any = None
@@ -277,7 +281,7 @@ class MainWindow(QMainWindow):
         self._last_analysis_record: Any = None
         self._last_analysis_frame: Any = None  # KlineFrame of the most recent analysis
         self._current_trade_plan_id: str | None = None
-        self._trade_ledger_window: Any = None
+        self._trade_ledger_window: Any = None  # embedded trading-management page
         self._trade_last_closed_ts: dict[tuple[str, str], int] = {}
         self._analysis_previous_record: Any = None  # incremental base record for chart continuity
         self._demo_mode = False
@@ -335,8 +339,12 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
 
-        self._central = self._build_workbench()
-        self.setCentralWidget(self._central)
+        self._analysis_page = self._build_workbench()
+        self._page_stack = QStackedWidget()
+        self._page_stack.setObjectName("mainContentStack")
+        self._page_stack.addWidget(self._analysis_page)
+        self._central = self._page_stack
+        self.setCentralWidget(self._page_stack)
 
         # ── Status bar ────────────────────────────────────────────────────────
         self._status_bar = QStatusBar()
@@ -354,6 +362,18 @@ class MainWindow(QMainWindow):
             self._trade_db_status.setStyleSheet("color: #f85149; font-weight: 600;")
             self._trade_db_status.setToolTip(trade_store.error)
             self._status_bar.addPermanentWidget(self._trade_db_status)
+        broker = getattr(self._ctx, "broker_adapter", None)
+        if broker is not None:
+            state = broker.connection
+            self._broker_status = QLabel(
+                "同花顺: 已连接" if state.usable else "同花顺: 未就绪"
+            )
+            self._broker_status.setStyleSheet(
+                "color: #3fb950; font-weight: 600;" if state.usable
+                else "color: #f85149; font-weight: 600;"
+            )
+            self._broker_status.setToolTip(state.message)
+            self._status_bar.addPermanentWidget(self._broker_status)
         self._refresh_api_key_ui_state()
 
         # ── Menu bar ─── 顶层直接触发按钮 + 演示模式下拉 ────────────────────
@@ -378,10 +398,24 @@ class MainWindow(QMainWindow):
         _general_action.triggered.connect(self._open_general_settings_dialog)
         menu_bar.addAction(_general_action)
 
-        trade_menu = menu_bar.addMenu("交易管理")
-        ledger_action = QAction("交易台账", self)
-        ledger_action.triggered.connect(self._open_trade_ledger)
-        trade_menu.addAction(ledger_action)
+        self._trade_management_action = QAction("交易管理", self)
+        self._trade_management_action.setToolTip("在当前窗口打开量化交易工作台")
+        self._trade_management_action.triggered.connect(self._open_trade_ledger)
+        menu_bar.addAction(self._trade_management_action)
+        self._trade_management_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+T"), self
+        )
+        self._trade_management_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self._trade_management_shortcut.activated.connect(self._open_trade_ledger)
+        self._return_to_analysis_shortcut = QShortcut(QKeySequence("Esc"), self)
+        self._return_to_analysis_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self._return_to_analysis_shortcut.activated.connect(
+            self._return_to_analysis_if_needed
+        )
 
         # 4. 演示模式 — 保留下拉菜单
         demo_menu = menu_bar.addMenu("演示模式")
@@ -4035,6 +4069,15 @@ class MainWindow(QMainWindow):
             return None
 
     def _confirm_current_execution(self) -> None:
+        QMessageBox.information(
+            self,
+            "AI仅用于研究",
+            "AI分析结果不能直接确认成交。请打开“量化交易工作台 / 同花顺绑定”，"
+            "仅对确定性量化策略生成且通过组合风控的计划进行预填和成交对账。",
+        )
+        return
+        # Legacy manual confirmation path intentionally unreachable.  Kept below
+        # temporarily so older saved plans remain readable during migration.
         plan_id = self._current_trade_plan_id
         store = getattr(self._ctx, "trade_store", None)
         if not plan_id or store is None or not store.available:
@@ -4116,11 +4159,37 @@ class MainWindow(QMainWindow):
         from pa_agent.gui.trade_ledger_window import TradeLedgerWindow
 
         if self._trade_ledger_window is None:
-            self._trade_ledger_window = TradeLedgerWindow(self._ctx, self)
+            self._trade_ledger_window = TradeLedgerWindow(self._ctx, self._page_stack)
+            self._trade_ledger_window.return_to_analysis_requested.connect(
+                self._show_analysis_page
+            )
+            self._page_stack.addWidget(self._trade_ledger_window)
         self._trade_ledger_window.refresh()
-        self._trade_ledger_window.show()
-        self._trade_ledger_window.raise_()
-        self._trade_ledger_window.activateWindow()
+        self._page_stack.setCurrentWidget(self._trade_ledger_window)
+        action = getattr(self, "_trade_management_action", None)
+        if action is not None:
+            action.setText("交易管理 · 当前")
+            action.setToolTip(
+                "量化交易工作台已在当前窗口打开（Esc 返回行情分析）"
+            )
+        self._status_bar.showMessage(
+            "交易管理工作台 · Esc 返回行情分析 · Ctrl+1～9 切换页面",
+            5000,
+        )
+
+    def _show_analysis_page(self) -> None:
+        self._page_stack.setCurrentWidget(self._analysis_page)
+        action = getattr(self, "_trade_management_action", None)
+        if action is not None:
+            action.setText("交易管理")
+            action.setToolTip(
+                "在当前窗口打开量化交易工作台（Ctrl+Shift+T）"
+            )
+        self._status_bar.showMessage("行情与AI分析", 3000)
+
+    def _return_to_analysis_if_needed(self) -> None:
+        if self._page_stack.currentWidget() is self._trade_ledger_window:
+            self._show_analysis_page()
 
     def _update_trade_lifecycle_from_bars(self, bars: Any, *, forming_ts: int | None) -> None:
         """Backfill unseen closed bars so restarts resume unfinished plans."""
@@ -4299,6 +4368,8 @@ class MainWindow(QMainWindow):
         """Stop background work before Qt destroys widgets."""
         self._window_closing = True
         try:
+            if self._trade_ledger_window is not None:
+                self._trade_ledger_window.shutdown()
             self._cancel_analysis_worker()
             self._cancel_snapshot_fetch_worker()
             self._stop_refresh_loop()
