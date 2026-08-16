@@ -14,12 +14,15 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -39,6 +42,8 @@ from pa_agent.trading.promotion import (
 )
 from pa_agent.trading.quant import SignalDecision, StrategyState
 from pa_agent.trading.topdown import (
+    MANUAL_EXCEPTION_STRATEGY_ID,
+    TOPDOWN_SCORING_VERSION,
     TOPDOWN_STRATEGY_ID,
     TopDownScoreSnapshot,
 )
@@ -46,7 +51,37 @@ from pa_agent.trading.topdown import (
 
 def _prefill_strategy_is_supported(strategy_version: str) -> bool:
     """Only the active 4:3:2:1 route and its explicit exception may reach prefill."""
-    return strategy_version in {TOPDOWN_STRATEGY_ID, "manual_exception_4321_v1"}
+    return strategy_version in {TOPDOWN_STRATEGY_ID, MANUAL_EXCEPTION_STRATEGY_ID}
+
+
+def _strategy_state_owner(strategy_version: str) -> str:
+    """Manual exceptions share the validated 4:3:2:1 strategy safety state."""
+    if strategy_version == MANUAL_EXCEPTION_STRATEGY_ID:
+        return TOPDOWN_STRATEGY_ID
+    return strategy_version
+
+
+def _monthly_risk_mode(
+    monthly_return_pct: float | None,
+    peak_drawdown_pct: float | None,
+    portfolio_settings,
+) -> str:
+    """Return the user-facing deterministic monthly risk regime."""
+    if monthly_return_pct is None:
+        return "月度风控 数据待核验"
+    if monthly_return_pct <= -portfolio_settings.monthly_stop_loss_pct:
+        return "月度风控 停止新增"
+    if monthly_return_pct <= -portfolio_settings.monthly_warning_loss_pct:
+        return f"月度风控 仅≥{portfolio_settings.highest_grade_score:g}分"
+    if monthly_return_pct >= portfolio_settings.monthly_profit_protect_pct:
+        return "月度风控 利润保护（风险减半）"
+    if (
+        peak_drawdown_pct is not None
+        and peak_drawdown_pct
+        >= portfolio_settings.monthly_peak_drawdown_reduce_pct
+    ):
+        return "月度风控 回撤保护（风险减半）"
+    return "月度风控 正常"
 
 
 class _StockProfileWorker(QObject):
@@ -64,6 +99,36 @@ class _StockProfileWorker(QObject):
             self.finished.emit(self.symbol, fetch_stock_extended_profile(self.symbol))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(self.symbol, str(exc))
+
+
+class _ManualStockAssessmentWorker(QObject):
+    finished = pyqtSignal(str, object, object, str)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self, symbol: str, scanner, pool_snapshot: dict) -> None:
+        super().__init__()
+        self.symbol = symbol
+        self.scanner = scanner
+        self.pool_snapshot = pool_snapshot
+
+    def run(self) -> None:
+        profile: dict = {}
+        profile_error = ""
+        try:
+            from pa_agent.data.eastmoney_extended import fetch_stock_extended_profile
+
+            profile = fetch_stock_extended_profile(self.symbol)
+        except Exception as exc:  # noqa: BLE001 - profile is research-only
+            profile_error = str(exc)
+        try:
+            evaluation = self.scanner.evaluate_manual_exception_from_pool(
+                self.symbol,
+                pool_snapshot=self.pool_snapshot,
+            )
+        except Exception as exc:  # noqa: BLE001 - deterministic review fails closed
+            self.failed.emit(self.symbol, str(exc))
+            return
+        self.finished.emit(self.symbol, profile, evaluation, profile_error)
 
 
 class _HotspotBatchWorker(QObject):
@@ -103,13 +168,7 @@ class _TopDownBatchWorker(QObject):
                 break
             try:
                 result = self.service.build_context(**job)
-                score = self.service.scoring.evaluate(result.context)
-                if result.data_gaps:
-                    score = score.model_copy(update={
-                        "data_gaps": list(dict.fromkeys([
-                            *score.data_gaps, *result.data_gaps,
-                        ])),
-                    })
+                score = self.service.evaluate(result)
                 self.score_ready.emit(score, result.closed_stock_bar)
             except Exception as exc:  # noqa: BLE001
                 self.failed.emit(job["symbol"], str(exc))
@@ -120,18 +179,16 @@ class _MarketSentimentWorker(QObject):
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, service, store, hs300_breadth_pct: float | None, captured_at) -> None:
+    def __init__(self, service, store, captured_at) -> None:
         super().__init__()
         self.service = service
         self.store = store
-        self.hs300_breadth_pct = hs300_breadth_pct
         self.captured_at = captured_at
 
     def run(self) -> None:
         try:
             self.finished.emit(self.service.capture_for_store(
                 store=self.store,
-                hs300_breadth_pct=self.hs300_breadth_pct,
                 captured_at=self.captured_at,
             ))
         except Exception as exc:  # noqa: BLE001
@@ -170,6 +227,46 @@ class _UniverseWorker(QObject):
             self.finished.emit(snapshot)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
+
+
+class _UniverseMutationWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str, str, bool)
+
+    def __init__(
+        self,
+        service,
+        *,
+        action: str,
+        value: str,
+        broker_snapshot=None,
+    ) -> None:
+        super().__init__()
+        self.service = service
+        self.action = action
+        self.value = value
+        self.broker_snapshot = broker_snapshot
+
+    def run(self) -> None:
+        from pa_agent.trading.universe import UniverseMutationBlocked
+
+        def progress(current: int, total: int, symbol: str) -> None:
+            self.progress.emit(current, total, symbol)
+        try:
+            if self.action == "add":
+                result = self.service.add_member(self.value, progress=progress)
+            else:
+                result = self.service.remove_member(
+                    self.value,
+                    broker_snapshot=self.broker_snapshot,
+                    progress=progress,
+                )
+            self.finished.emit(result)
+        except UniverseMutationBlocked as exc:
+            self.failed.emit(self.action, str(exc), True)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self.action, str(exc), False)
 
 
 class _DailyCandidateWorker(QObject):
@@ -226,6 +323,27 @@ class _OosBacktestWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class _ProductionOosWorker(QObject):
+    finished = pyqtSignal(str, object)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self, exporter, *, mode: str, destination: Path | None = None) -> None:
+        super().__init__()
+        self.exporter = exporter
+        self.mode = mode
+        self.destination = destination
+
+    def run(self) -> None:
+        try:
+            if self.mode == "audit":
+                result = self.exporter.audit()
+            else:
+                result = self.exporter.export(self.destination)
+            self.finished.emit(self.mode, result)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self.mode, str(exc))
+
+
 class TradeLedgerWindow(QWidget):
     """Embedded quant-management page kept under its legacy public name."""
 
@@ -241,17 +359,25 @@ class TradeLedgerWindow(QWidget):
             if self._quant_runtime is not None else None
         )
         self._stock_profile_thread: QThread | None = None
+        self._stock_profile_worker: QObject | None = None
         self._hotspot_thread: QThread | None = None
         self._topdown_thread: QThread | None = None
         self._sentiment_thread: QThread | None = None
         self._universe_thread: QThread | None = None
+        self._universe_mutation_thread: QThread | None = None
+        self._universe_mutation_worker: QObject | None = None
         self._daily_candidate_thread: QThread | None = None
         self._lifecycle_sync_thread: QThread | None = None
         self._oos_backtest_thread: QThread | None = None
         self._oos_backtest_worker: _OosBacktestWorker | None = None
+        self._production_oos_thread: QThread | None = None
+        self._production_oos_worker: _ProductionOosWorker | None = None
+        self._production_oos_audit = None
         self._validated_oos_bundle_path = ""
         self._last_lifecycle_sync: dict = {}
         self._last_topdown_slot = ""
+        self._table_empty_labels: dict[QTableWidget, QLabel] = {}
+        self._manual_refresh_started_at: datetime | None = None
         self._reconciliation_timer = QTimer(self)
         self._reconciliation_timer.setInterval(2000)
         self._reconciliation_timer.timeout.connect(self._poll_reconciliation)
@@ -262,7 +388,8 @@ class TradeLedgerWindow(QWidget):
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(8)
-        root_layout.addWidget(self._build_dashboard_header())
+        self.dashboard_header = self._build_dashboard_header()
+        root_layout.addWidget(self.dashboard_header)
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
@@ -273,16 +400,25 @@ class TradeLedgerWindow(QWidget):
         self.universe = self._build_universe_page()
         self.stock_page = self._build_stock_page()
         self.broker_page = self._build_broker_page()
-        self.pending = self._table_tab([
-            "计划ID", "策略/来源", "股票", "池版本", "方向", "触发价", "最高价",
-            "止损", "总分", "连续确认", "风控/计划状态", "有效期",
-        ])
-        self.open_positions = self._table_tab([
-            "计划ID", "品种", "成交价", "数量", "当前保护止损", "当前风险", "浮动R", "退出状态",
-        ])
-        self.closed = self._table_tab([
-            "计划ID", "数据集", "品种", "结果", "毛收益", "净收益", "R", "MFE(R)", "MAE(R)", "持有K线",
-        ])
+        self.pending = self._table_tab(
+            [
+                "计划ID", "策略/来源", "股票", "池版本", "方向", "触发价", "最高价",
+                "止损", "总分", "连续确认", "风控/计划状态", "有效期",
+            ],
+            "当前没有待执行的量化交易计划。计划只会在日线候选、连续两根15分钟评分和组合风控全部通过后出现。",
+        )
+        self.open_positions = self._table_tab(
+            [
+                "计划ID", "品种", "成交价", "数量", "当前保护止损", "当前风险", "浮动R", "退出状态",
+            ],
+            "当前没有由量化策略管理的真实持仓。同花顺中的外部手工交易会单独对账，不混入策略绩效。",
+        )
+        self.closed = self._table_tab(
+            [
+                "计划ID", "数据集", "品种", "结果", "毛收益", "净收益", "R", "MFE(R)", "MAE(R)", "持有K线",
+            ],
+            "当前没有已结束的策略交易。影子交易与真实交易会继续分开记录。",
+        )
         self.monthly_page = self._build_monthly_page()
         self.validation_page = self._build_validation_page()
         self.audit_settings_page = self._build_audit_settings_page()
@@ -305,6 +441,7 @@ class TradeLedgerWindow(QWidget):
             )
             self._page_shortcuts.append(shortcut)
         self._add_actions()
+        self._on_navigation_changed(0)
         for _, table in (self.pending, self.open_positions, self.closed):
             table.doubleClicked.connect(self._show_selected_audit)
         self.universe[1].doubleClicked.connect(
@@ -357,32 +494,42 @@ class TradeLedgerWindow(QWidget):
             "color:#8b949e; padding:4px 8px; background:#18222c; border-radius:4px;"
         )
         self.activity_status_label.setMaximumWidth(300)
+        self.activity_status_label.setMinimumWidth(0)
+        self.activity_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.activity_status_label.setToolTip("常驻量化采集不会因页面切换而停止")
-        status_row.addWidget(self.activity_status_label)
-        self.header_refresh_button = QPushButton("刷新视图")
+        status_row.addWidget(self.activity_status_label, 1)
+        self.header_refresh_button = QPushButton("立即同步")
         self.header_refresh_button.setObjectName("quantRefreshButton")
-        self.header_refresh_button.setToolTip("刷新当前数据库、评分和账户视图")
-        self.header_refresh_button.setMaximumWidth(96)
-        self.header_refresh_button.clicked.connect(self.refresh)
+        self.header_refresh_button.setToolTip(
+            "立即同步同花顺只读快照，并刷新股票池、日线候选、热点和四层评分"
+        )
+        self.header_refresh_button.setMaximumWidth(104)
+        self.header_refresh_button.clicked.connect(self._refresh_all_now)
         status_row.addWidget(self.header_refresh_button)
+        status_row.addStretch(1)
         layout.addLayout(status_row)
 
         system_row = QHBoxLayout()
         self.system_status_line = QLabel("同花顺 ● 检测中 | 策略 CANDIDATE | 股票池尚未加载")
         self.system_status_line.setWordWrap(True)
+        self.system_status_line.setMinimumWidth(0)
         self.system_status_line.setStyleSheet("font-weight:600; color:#e6edf3;")
         system_row.addWidget(self.system_status_line, 1)
         layout.addLayout(system_row)
 
-        score_row = QHBoxLayout()
-        score_row.setSpacing(6)
+        score_grid = QGridLayout()
+        score_grid.setHorizontalSpacing(6)
+        score_grid.setVerticalSpacing(6)
         self.score_labels: dict[str, QLabel] = {}
-        for key, text, stretch in (
-            ("index", "指数 —/40", 4),
-            ("sentiment", "情绪 —/30", 3),
-            ("theme", "题材 —/20", 2),
-            ("stock", "个股 —/10", 1),
-        ):
+        for position, (key, text) in enumerate((
+            ("index", "指数 —/40"),
+            ("sentiment", "情绪 —/30"),
+            ("theme", "题材 —/20"),
+            ("stock", "个股 —/10"),
+        )):
+            row, column = divmod(position, 2)
             label = _ScoreLabel(key, text)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setMinimumHeight(34)
@@ -392,8 +539,9 @@ class TradeLedgerWindow(QWidget):
             )
             label.setToolTip("点击展开评分依据、数据时间和未得分原因")
             label.setCursor(Qt.CursorShape.PointingHandCursor)
+            label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             label.clicked.connect(self._toggle_score_details)
-            score_row.addWidget(label, stretch)
+            score_grid.addWidget(label, row, column)
             self.score_labels[key] = label
         self.total_score_label = QLabel("综合 —/100 | 数据未就绪")
         self.total_score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -401,8 +549,12 @@ class TradeLedgerWindow(QWidget):
             "background:#17252a; color:#5eead4; border:1px solid #24534d; "
             "border-radius:4px; padding:5px 10px; font-weight:700;"
         )
-        score_row.addWidget(self.total_score_label, 3)
-        layout.addLayout(score_row)
+        self.total_score_label.setMinimumHeight(34)
+        score_grid.addWidget(self.total_score_label, 0, 2, 2, 1)
+        score_grid.setColumnStretch(0, 4)
+        score_grid.setColumnStretch(1, 3)
+        score_grid.setColumnStretch(2, 3)
+        layout.addLayout(score_grid)
         self.score_detail_panel = QTextEdit()
         self.score_detail_panel.setReadOnly(True)
         self.score_detail_panel.setMaximumHeight(180)
@@ -415,11 +567,91 @@ class TradeLedgerWindow(QWidget):
         self.risk_status_line.setStyleSheet(
             "color:#8b949e; font-family:'Cascadia Mono','Consolas';"
         )
+        self.risk_status_line.setWordWrap(True)
+        self.risk_status_line.setMinimumWidth(0)
         layout.addWidget(self.risk_status_line)
+
+        guidance_row = QHBoxLayout()
+        guidance_row.setSpacing(8)
+        self.guidance_context_line = QLabel(
+            "发生了什么：正在检查同花顺、账户事实表、策略验证和四层评分。\n"
+            "为什么：任何关键数据未核验时，系统都会保持只读并阻断实盘。"
+        )
+        self.guidance_context_line.setObjectName("quantGuidanceContext")
+        self.guidance_context_line.setWordWrap(True)
+        self.guidance_context_line.setMinimumWidth(0)
+        self.guidance_context_line.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.guidance_context_line.setStyleSheet(
+            "color:#d8dee4; background:#18222c; border-left:3px solid #38bdf8; "
+            "padding:7px 9px; border-radius:3px;"
+        )
+        guidance_row.addWidget(self.guidance_context_line, 1)
+        self.guidance_action_button = QPushButton("查看处理入口")
+        self.guidance_action_button.setObjectName("quantGuidanceActionButton")
+        self.guidance_action_button.setMinimumWidth(128)
+        self.guidance_action_button.setToolTip("根据当前最优先事项打开对应页面")
+        self.guidance_action_button.clicked.connect(self._run_guidance_action)
+        self._guidance_action = "broker"
+        guidance_row.addWidget(self.guidance_action_button)
+        layout.addLayout(guidance_row)
+        self.guidance_line = QLabel(
+            "下一步：先登录同花顺并完成只读账户绑定；策略验证未通过前，实盘入口保持关闭。"
+        )
+        self.guidance_line.setObjectName("quantGuidanceLine")
+        self.guidance_line.setWordWrap(True)
+        self.guidance_line.setMinimumWidth(0)
+        self.guidance_line.setStyleSheet(
+            "color:#c9d1d9; background:#141d26; border-left:3px solid #f59e0b; "
+            "padding:6px 9px; border-radius:3px;"
+        )
+        layout.addWidget(self.guidance_line)
         return frame
 
+    def _set_experience_guidance(
+        self,
+        *,
+        happened: str,
+        reason: str,
+        next_step: str,
+        action: str,
+        action_text: str,
+    ) -> None:
+        """Keep every operational state understandable and directly actionable."""
+        self.guidance_context_line.setText(
+            f"发生了什么：{happened}\n为什么：{reason}"
+        )
+        self.guidance_line.setText(f"下一步：{next_step}")
+        self._guidance_action = action
+        self.guidance_action_button.setText(action_text)
+        self.guidance_action_button.setEnabled(True)
+
+    def _run_guidance_action(self) -> None:
+        action = self._guidance_action
+        if action == "refresh":
+            self._refresh_all_now()
+            return
+        tab_by_action = {
+            "today": 0,
+            "universe": 1,
+            "plans": 3,
+            "broker": 6,
+            "validation": 7,
+        }
+        target = tab_by_action.get(action)
+        if target is not None:
+            self.tabs.setCurrentIndex(target)
+
     def _toggle_score_details(self, component: str) -> None:
-        score_record = self.store.latest_topdown_score() if self.store.available else None
+        score_record = (
+            self.store.latest_topdown_score(
+                strategy_version=TOPDOWN_STRATEGY_ID,
+                scoring_version=TOPDOWN_SCORING_VERSION,
+            )
+            if self.store.available
+            else None
+        )
         score = (score_record or {}).get("snapshot") or {}
         if (
             self.score_detail_panel.isVisible()
@@ -442,8 +674,45 @@ class TradeLedgerWindow(QWidget):
     def _build_universe_page(self) -> tuple[QWidget, QTableWidget]:
         page = QWidget()
         layout = QVBoxLayout(page)
+        management = QFrame()
+        management.setObjectName("privateUniverseManagement")
+        management.setStyleSheet(
+            "QFrame#privateUniverseManagement { background:#101820; border:1px solid #2b3946; "
+            "border-radius:6px; }"
+        )
+        management_layout = QVBoxLayout(management)
+        management_layout.setContentsMargins(10, 9, 10, 9)
+        management_layout.setSpacing(6)
+        title = QLabel("管理当前私人A股股票池")
+        title.setStyleSheet("font-weight:700; color:#e6edf3; border:none;")
+        hint = QLabel(
+            "新增和移除都会生成新版本，历史信号、交易和绩效不会删除。"
+            "有持仓、开放计划或待对账记录的股票不能直接移除。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#9da7b3; border:none;")
+        mutation_row = QHBoxLayout()
+        self.universe_member_input = QLineEdit()
+        self.universe_member_input.setClearButtonEnabled(True)
+        self.universe_member_input.setPlaceholderText("输入6位A股代码或完整股票名称")
+        self.universe_member_input.setAccessibleName("新增A股股票代码或名称")
+        self.universe_add_button = QPushButton("新增股票")
+        self.universe_add_button.setToolTip("校验A股身份、行情和上市日期后生成新股票池版本")
+        self.universe_remove_button = QPushButton("移除选中股票")
+        self.universe_remove_button.setToolTip("先检查持仓、委托、开放计划和待对账记录")
+        self.universe_remove_button.setEnabled(False)
+        self.universe_add_button.clicked.connect(self._add_universe_member)
+        self.universe_member_input.returnPressed.connect(self._add_universe_member)
+        self.universe_remove_button.clicked.connect(self._remove_selected_universe_member)
+        mutation_row.addWidget(self.universe_member_input, 1)
+        mutation_row.addWidget(self.universe_add_button)
+        mutation_row.addWidget(self.universe_remove_button)
+        management_layout.addWidget(title)
+        management_layout.addWidget(hint)
+        management_layout.addLayout(mutation_row)
+        layout.addWidget(management)
         controls = QHBoxLayout()
-        generate = QPushButton("生成/刷新新云算力股票池")
+        generate = QPushButton("刷新当前股票池行情")
         generate.clicked.connect(self._generate_current_universe)
         self.universe_generate_button = generate
         self.universe_status = QLabel(
@@ -453,6 +722,25 @@ class TradeLedgerWindow(QWidget):
         controls.addWidget(generate)
         controls.addWidget(self.universe_status, 1)
         layout.addLayout(controls)
+        search_row = QHBoxLayout()
+        search_label = QLabel("快速查找")
+        search_label.setObjectName("mutedLabel")
+        self.universe_search = QLineEdit()
+        self.universe_search.setClearButtonEnabled(True)
+        self.universe_search.setPlaceholderText("输入代码、名称、梯队或题材；双击结果打开股票详情")
+        self.universe_search.setAccessibleName("交易股票池快速查找")
+        self.universe_search.textChanged.connect(self._filter_universe_rows)
+        search_row.addWidget(search_label)
+        search_row.addWidget(self.universe_search, 1)
+        layout.addLayout(search_row)
+        self.universe_filter_feedback = QLabel()
+        self.universe_filter_feedback.setObjectName("universeFilterFeedback")
+        self.universe_filter_feedback.setWordWrap(True)
+        self.universe_filter_feedback.setStyleSheet(
+            "padding:8px 10px; color:#fbbf24; background:#28230f; border-radius:4px;"
+        )
+        self.universe_filter_feedback.setVisible(False)
+        layout.addWidget(self.universe_filter_feedback)
         tabs = QTabWidget()
         current_page, current_table = self._table_tab([
             "排名", "代码", "名称", "行业/题材", "20日均成交额", "最新价", "涨跌幅",
@@ -484,15 +772,20 @@ class TradeLedgerWindow(QWidget):
         manual_row = QHBoxLayout()
         self.manual_universe_symbol = QLineEdit()
         self.manual_universe_symbol.setPlaceholderText("输入股票代码或名称")
+        self.manual_universe_symbol.setAccessibleName("池外股票代码或名称")
         manual_button = QPushButton("打开专业评估")
         manual_button.clicked.connect(self._open_manual_stock_assessment)
+        self.manual_universe_symbol.returnPressed.connect(
+            self._open_manual_stock_assessment
+        )
         manual_row.addWidget(self.manual_universe_symbol, 1)
         manual_row.addWidget(manual_button)
         manual_layout.addWidget(manual_hint)
         manual_layout.addLayout(manual_row)
         manual_layout.addStretch(1)
         history_page, self.universe_history_table = self._table_tab([
-            "版本", "生效日期", "成员数", "排除数", "数据完整", "来源更新时间",
+            "版本", "生效日期", "成员数", "排除数", "变更", "父版本",
+            "数据完整", "来源更新时间",
         ])
         tabs.addTab(current_page, "当前基础池")
         tabs.addTab(candidate_page, "今日候选")
@@ -501,7 +794,194 @@ class TradeLedgerWindow(QWidget):
         tabs.addTab(history_page, "历史股票池")
         self.universe_tabs = tabs
         layout.addWidget(tabs)
+        current_table.itemSelectionChanged.connect(
+            self._update_universe_remove_button
+        )
+        service = getattr(self.ctx, "universe_service", None)
+        editable = bool(
+            service is not None
+            and hasattr(service, "add_member")
+            and hasattr(service, "remove_member")
+        )
+        self.universe_member_input.setEnabled(editable)
+        self.universe_add_button.setEnabled(editable)
+        if not editable:
+            unavailable = "当前运行环境未启用版本化私人A股股票池管理"
+            self.universe_member_input.setToolTip(unavailable)
+            self.universe_add_button.setToolTip(unavailable)
         return page, current_table
+
+    def _update_universe_remove_button(self) -> None:
+        service = getattr(self.ctx, "universe_service", None)
+        editable = bool(service is not None and hasattr(service, "remove_member"))
+        busy = bool(
+            self._universe_mutation_thread is not None
+            and self._universe_mutation_thread.isRunning()
+        )
+        self.universe_remove_button.setEnabled(
+            editable and not busy and self.universe[1].currentRow() >= 0
+        )
+
+    def _add_universe_member(self) -> None:
+        value = self.universe_member_input.text().strip()
+        if not value:
+            self.universe_member_input.setFocus()
+            self.universe_status.setText("请输入6位A股股票代码或完整股票名称。")
+            return
+        self._start_universe_mutation("add", value)
+
+    def _remove_selected_universe_member(self) -> None:
+        row = self.universe[1].currentRow()
+        item = self.universe[1].item(row, 1) if row >= 0 else None
+        symbol = item.text().strip() if item is not None else ""
+        name_item = self.universe[1].item(row, 2) if row >= 0 else None
+        name = name_item.text().strip() if name_item is not None else symbol
+        if not symbol:
+            self.universe_status.setText("请先在“当前基础池”中选择一只股票。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认移出当前股票池",
+            f"确定移除 {name}（{symbol}）吗？\n\n"
+            "系统会先检查持仓、未完成委托、开放计划和待对账记录。"
+            "移除成功后会生成新版本，历史记录不会删除，策略需重新验证。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._start_universe_mutation("remove", symbol)
+
+    def _start_universe_mutation(self, action: str, value: str) -> None:
+        service = getattr(self.ctx, "universe_service", None)
+        if service is None or not hasattr(service, f"{action}_member"):
+            QMessageBox.warning(
+                self,
+                "股票池管理不可用",
+                "当前运行环境未启用版本化私人A股股票池管理。",
+            )
+            return
+        if (
+            self._universe_mutation_thread is not None
+            and self._universe_mutation_thread.isRunning()
+        ):
+            return
+        self.universe_add_button.setEnabled(False)
+        self.universe_remove_button.setEnabled(False)
+        self.universe_member_input.setEnabled(False)
+        verb = "新增" if action == "add" else "移除"
+        self.universe_status.setText(
+            f"正在{verb} {value}：校验A股身份、行情和风险状态…"
+        )
+        thread = QThread(self)
+        worker = _UniverseMutationWorker(
+            service,
+            action=action,
+            value=value,
+            broker_snapshot=self._broker_snapshot,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._universe_mutation_progress)
+        worker.finished.connect(self._universe_mutation_finished)
+        worker.failed.connect(self._universe_mutation_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._universe_mutation_thread_finished)
+        self._universe_mutation_thread = thread
+        self._universe_mutation_worker = worker
+        thread.start()
+
+    def _universe_mutation_progress(
+        self, current: int, total: int, symbol: str
+    ) -> None:
+        self.universe_status.setText(
+            f"正在生成新股票池版本 {current}/{total} | 当前校验 {symbol}"
+        )
+
+    def _universe_mutation_finished(self, result) -> None:
+        snapshot = result.snapshot
+        if self._quant_runtime is not None and hasattr(
+            self._quant_runtime, "universe_revision_committed"
+        ):
+            self._quant_runtime.universe_revision_committed(snapshot)
+        else:
+            recorder = getattr(self.ctx, "oos_observation_recorder", None)
+            if recorder is not None:
+                recorder.record_universe(snapshot)
+            self.refresh()
+            QTimer.singleShot(0, self._ensure_daily_candidates)
+            QTimer.singleShot(0, self._refresh_hotspots)
+            QTimer.singleShot(0, self._refresh_topdown_scores)
+        if result.action == "add":
+            self.universe_member_input.clear()
+        self.universe_status.setText(
+            f"{result.name}（{result.symbol}）已"
+            f"{'新增' if result.action == 'add' else '移除'} | "
+            f"新版本 {snapshot.version} | 当前 {len(snapshot.symbols)}只 | "
+            "旧版本和历史绩效已保留，实盘资格需重新验证"
+        )
+        QMessageBox.information(
+            self,
+            "股票池版本已更新",
+            f"{snapshot.change_summary}\n\n新版本：{snapshot.version}\n"
+            f"成员数量：{len(snapshot.symbols)}只\n"
+            "历史版本、旧信号和旧交易仍可审计。",
+        )
+
+    def _universe_mutation_failed(
+        self, action: str, error: str, blocked: bool
+    ) -> None:
+        verb = "新增" if action == "add" else "移除"
+        self.universe_status.setText(f"{verb}失败：{error}")
+        QMessageBox.warning(
+            self,
+            "移除已被风险保护阻断" if blocked else f"股票{verb}失败",
+            error,
+        )
+        if blocked:
+            if "持仓" in error:
+                self.tabs.setCurrentIndex(4)
+            elif "计划" in error or "对账" in error:
+                self.tabs.setCurrentIndex(3)
+
+    def _universe_mutation_thread_finished(self) -> None:
+        self._universe_mutation_thread = None
+        self._universe_mutation_worker = None
+        editable = bool(
+            getattr(self.ctx, "universe_service", None) is not None
+            and hasattr(self.ctx.universe_service, "add_member")
+        )
+        self.universe_member_input.setEnabled(editable)
+        self.universe_add_button.setEnabled(editable)
+        self._update_universe_remove_button()
+
+    def _filter_universe_rows(self, text: str) -> None:
+        query = text.strip().casefold()
+        table = self.universe[1]
+        visible_count = 0
+        for row in range(table.rowCount()):
+            haystack = " ".join(
+                table.item(row, column).text()
+                for column in range(table.columnCount())
+                if table.item(row, column) is not None
+            ).casefold()
+            hidden = bool(query and query not in haystack)
+            table.setRowHidden(row, hidden)
+            if not hidden:
+                visible_count += 1
+        self.universe_search.setToolTip(
+            f"当前显示 {visible_count}/{table.rowCount()} 只股票"
+        )
+        no_match = bool(query and table.rowCount() and visible_count == 0)
+        self.universe_filter_feedback.setText(
+            f"没有找到“{text.strip()}”。可清空搜索查看全部 {table.rowCount()} 只，"
+            "或到“手工查询与专业评估”检查池外股票。"
+            if no_match else ""
+        )
+        self.universe_filter_feedback.setVisible(no_match)
 
     def _ensure_current_universe(self) -> None:
         if self._quant_runtime is not None:
@@ -530,7 +1010,7 @@ class TradeLedgerWindow(QWidget):
         if self._universe_thread is not None and self._universe_thread.isRunning():
             return
         self.universe_generate_button.setEnabled(False)
-        self.universe_status.setText("正在校验新云算力 11 股的行情、上市日期与交易制度…")
+        self.universe_status.setText("正在刷新当前私人A股股票池的行情与交易资格…")
         thread = QThread(self)
         worker = _UniverseWorker(service)
         worker.moveToThread(thread)
@@ -548,7 +1028,7 @@ class TradeLedgerWindow(QWidget):
 
     def _universe_progress(self, current: int, total: int, symbol: str) -> None:
         self.universe_status.setText(
-            f"正在校验固定池行情与上市日期 {current}/{total} | 当前 {symbol}"
+            f"正在校验股票池行情与上市日期 {current}/{total} | 当前 {symbol}"
         )
 
     def _universe_generated(self, snapshot) -> None:
@@ -563,7 +1043,7 @@ class TradeLedgerWindow(QWidget):
         if snapshot.data_complete:
             self.universe_status.setText(
                 f"{snapshot.version} 已生成：{len(snapshot.symbols)}只 | "
-                f"用户固定成员日期 {snapshot.source_as_of} | 输入 {snapshot.input_member_count}只"
+                f"版本生效日期 {snapshot.source_as_of} | 输入 {snapshot.input_member_count}只"
             )
         else:
             self.universe_status.setText(
@@ -681,6 +1161,9 @@ class TradeLedgerWindow(QWidget):
         self.tabs.setToolTip(
             f"当前位置：{label} · Ctrl+{index + 1} 可直接打开此页"
         )
+        self.activity_status_label.setText(
+            f"当前位置：{label} · 数据监控持续运行"
+        )
 
     def _build_today_page(self) -> QWidget:
         page = QWidget()
@@ -715,10 +1198,16 @@ class TradeLedgerWindow(QWidget):
         row = QHBoxLayout()
         self.stock_symbol = QLineEdit()
         self.stock_symbol.setPlaceholderText("输入A股代码或名称，例如 600519 / 贵州茅台")
-        load = QPushButton("加载股票信息")
-        load.clicked.connect(self._load_stock_detail)
+        self.stock_symbol.setAccessibleName("股票代码或名称")
+        self.stock_load_button = QPushButton("查询并专业评估")
+        self.stock_load_button.setToolTip(
+            "池内股票读取既有量化状态；池外A股会重新核验基础池市场宽度并执行"
+            "日线策略。查询不会修改基础股票池，也不会直接授权或下单。"
+        )
+        self.stock_load_button.clicked.connect(self._load_stock_detail)
+        self.stock_symbol.returnPressed.connect(self._load_stock_detail)
         row.addWidget(self.stock_symbol, 1)
-        row.addWidget(load)
+        row.addWidget(self.stock_load_button)
         layout.addLayout(row)
         self.stock_tabs = QTabWidget()
         self.stock_detail_texts: dict[str, QTextEdit] = {}
@@ -769,11 +1258,36 @@ class TradeLedgerWindow(QWidget):
         self.run_oos_button = QPushButton("运行日线+15分钟组合样本外回测")
         self.run_oos_button.setEnabled(False)
         self.run_oos_button.setToolTip(
-            "必须先导入并通过 pa_oos_bundle_v1 校验; 回测在后台运行, "
+            "必须先导入并通过当前策略 pa_oos_bundle_v2 校验；旧沪深300 v1包只供历史审计。"
+            "回测在后台运行，"
             "只有完整证据达到全部门槛才会进入 SHADOW。"
         )
         self.run_oos_button.clicked.connect(self._run_oos_backtest)
+        self.market_history_button = QPushButton("补齐真实全A 21日情绪基线")
+        self.market_history_button.setToolTip(
+            "逐股读取东方财富未复权日线并按真实交易日续传。不会复制当天值、"
+            "不会伪造历史；每天覆盖不足3000只时评分仍保持阻断。"
+        )
+        self.market_history_button.clicked.connect(self._backfill_market_history)
+        self.audit_production_oos_button = QPushButton("审核生产 OOS 覆盖")
+        self.audit_production_oos_button.setToolTip(
+            "检查固定股票池、65个日线热身交易日、每个闭合15分钟槽、完整市场情绪和逐股热点。"
+        )
+        self.audit_production_oos_button.clicked.connect(
+            self._audit_production_oos
+        )
+        self.export_production_oos_button = QPushButton("导出生产 OOS 数据包")
+        self.export_production_oos_button.setEnabled(False)
+        self.export_production_oos_button.setToolTip(
+            "只有生产原始账本通过完整性审核后才可导出；导出前会再次审核。"
+        )
+        self.export_production_oos_button.clicked.connect(
+            self._export_production_oos
+        )
         layout.addWidget(QLabel("策略晋级路线：CANDIDATE → SHADOW → ACTIVE → REDUCED → PAUSED → RETIRED"))
+        layout.addWidget(self.market_history_button)
+        layout.addWidget(self.audit_production_oos_button)
+        layout.addWidget(self.export_production_oos_button)
         layout.addWidget(self.import_oos_button)
         layout.addWidget(self.run_oos_button)
         layout.addWidget(self.small_live_button)
@@ -788,15 +1302,38 @@ class TradeLedgerWindow(QWidget):
         tabs.addTab(self._build_config(), "风险与实盘设置")
         return tabs
 
-    def _table_tab(self, headers: list[str]) -> tuple[QWidget, QTableWidget]:
+    def _table_tab(
+        self,
+        headers: list[str],
+        empty_message: str = "",
+    ) -> tuple[QWidget, QTableWidget]:
         page = QWidget()
         layout = QVBoxLayout(page)
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.horizontalHeader().setStretchLastSection(True)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+        header = table.horizontalHeader()
+        header.setMinimumSectionSize(76)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
         layout.addWidget(table)
+        if empty_message:
+            empty_label = QLabel(empty_message)
+            empty_label.setObjectName("tableEmptyState")
+            empty_label.setWordWrap(True)
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_label.setStyleSheet(
+                "padding:18px; color:#8b949e; border:1px dashed #30363d; "
+                "border-radius:6px; background:#0d131a;"
+            )
+            layout.addWidget(empty_label)
+            self._table_empty_labels[table] = empty_label
         return page, table
 
     def _build_broker_page(self) -> QWidget:
@@ -988,6 +1525,9 @@ class TradeLedgerWindow(QWidget):
         self.max_open = _pct_spin(risk.max_open_risk_pct)
         self.initial_per_trade = _pct_spin(portfolio.initial_per_trade_risk_pct)
         self.initial_max_open = _pct_spin(portfolio.initial_max_open_risk_pct)
+        self.monthly_warning = _pct_spin(portfolio.monthly_warning_loss_pct)
+        self.highest_grade = _pct_spin(portfolio.highest_grade_score)
+        self.monthly_stop = _pct_spin(portfolio.monthly_stop_loss_pct)
         self.daily = _pct_spin(risk.daily_loss_warning_pct)
         self.weekly = _pct_spin(risk.weekly_loss_warning_pct)
         self.live_enabled = QCheckBox("显式允许实盘授权（仍受策略状态和同花顺完整快照约束）")
@@ -1009,6 +1549,9 @@ class TradeLedgerWindow(QWidget):
         form.addRow("升级后最大开放风险 %", self.max_open)
         form.addRow("首批单笔风险 %", self.initial_per_trade)
         form.addRow("首批最大开放风险 %", self.initial_max_open)
+        form.addRow("月亏警戒 %", self.monthly_warning)
+        form.addRow("警戒后最低综合分", self.highest_grade)
+        form.addRow("月亏停止新增 %", self.monthly_stop)
         form.addRow("单日亏损警戒 %", self.daily)
         form.addRow("单周亏损警戒 %", self.weekly)
         form.addRow("实盘总开关", self.live_enabled)
@@ -1114,7 +1657,10 @@ class TradeLedgerWindow(QWidget):
         self.broker_funds.setText(
             f"总资产 {_money(snapshot.total_equity)} | 可用资金 {_money(snapshot.available_cash)} | "
             f"持仓市值 {_money(snapshot.position_value)} | 当日盈亏 {_signed_money(snapshot.daily_pnl)} | "
-            f"快照 {'完整' if snapshot.complete else '不完整'}"
+            f"快照 {'完整' if snapshot.complete else '不完整'}\n"
+            f"事实表核验：持仓 {'完成' if snapshot.positions_complete else '未完成'} | "
+            f"当日委托 {'完成' if snapshot.orders_complete else '未完成'} | "
+            f"当日成交 {'完成' if snapshot.fills_complete else '未完成'}"
         )
         self._fill(self.broker_positions, [[
             item.symbol, item.name, item.quantity, item.sellable_quantity,
@@ -1140,8 +1686,11 @@ class TradeLedgerWindow(QWidget):
             "持仓市值": snapshot.position_value,
             "当日盈亏": snapshot.daily_pnl,
             "持仓": [item.model_dump(mode="json") for item in snapshot.positions],
+            "持仓表已核验": snapshot.positions_complete,
             "当日委托": [item.model_dump(mode="json") for item in snapshot.orders],
+            "当日委托表已核验": snapshot.orders_complete,
             "当日成交": [item.model_dump(mode="json") for item in snapshot.fills],
+            "当日成交表已核验": snapshot.fills_complete,
             "本月资金流水": [
                 item.model_dump(mode="json") for item in snapshot.cash_flows
             ],
@@ -1160,15 +1709,114 @@ class TradeLedgerWindow(QWidget):
             "daily_candidates": "日线候选",
             "hotspots": "热点",
             "sentiment": "市场情绪",
+            "market_history": "全A历史基线",
             "topdown": "四层评分",
             "lifecycle": "持仓生命周期",
         }.get(task, task)
-        self.activity_status_label.setText(f"{friendly_task}：{detail}")
+        friendly_detail = _friendly_runtime_detail(task, detail)
+        self.activity_status_label.setText(f"{friendly_task}：{friendly_detail}")
+        self.activity_status_label.setToolTip(
+            f"{friendly_task}：{detail}" if friendly_detail != detail else detail
+        )
         busy = detail.startswith("正在")
-        self.header_refresh_button.setEnabled(not busy)
+        if self._manual_refresh_started_at is None:
+            self.header_refresh_button.setEnabled(not busy)
+            self.header_refresh_button.setText("同步中…" if busy else "立即同步")
         if task in {"universe", "daily_candidates"}:
             self.universe_status.setText(detail)
             self.universe_generate_button.setEnabled(not busy)
+        if task == "market_history":
+            self.market_history_button.setEnabled(not busy)
+
+    def _backfill_market_history(self) -> None:
+        runtime = self._quant_runtime
+        if runtime is None or not hasattr(runtime, "ensure_market_history"):
+            QMessageBox.warning(
+                self,
+                "历史回填不可用",
+                "当前运行环境未启用真实全A历史回填服务。",
+            )
+            return
+        self.market_history_button.setEnabled(False)
+        self.activity_status_label.setText(
+            "全A历史基线：正在启动可恢复回填，应用可继续使用…"
+        )
+        runtime.ensure_market_history(force=True)
+
+    def _refresh_all_now(self) -> None:
+        """Give the user one predictable refresh action without weakening gates."""
+        if self._manual_refresh_started_at is not None:
+            return
+        self._manual_refresh_started_at = datetime.now().astimezone()
+        self.header_refresh_button.setEnabled(False)
+        self.header_refresh_button.setText("同步中…")
+        self.activity_status_label.setText("正在刷新账户、股票池和量化状态…")
+        self.guidance_context_line.setText(
+            "发生了什么：已启动账户、股票池、热点、评分和持仓生命周期的刷新。\n"
+            "为什么：这些数据来自不同采集链，最终状态会在各项回读完成后分别更新。"
+        )
+        self.guidance_line.setText(
+            "下一步：可以继续查看其他页面；请等待顶部状态更新，不要重复点击同步。"
+        )
+        self.guidance_action_button.setText("正在同步")
+        self.guidance_action_button.setEnabled(False)
+        self.refresh()
+        if self._quant_runtime is not None:
+            self._quant_runtime.sync_broker()
+            self._quant_runtime.ensure_current_universe(force=True)
+            self._quant_runtime.ensure_daily_candidates()
+            self._quant_runtime.refresh_hotspots()
+            self._quant_runtime.refresh_topdown_scores()
+            self._quant_runtime.sync_daily_lifecycle()
+        else:
+            self._sync_broker()
+            self._ensure_current_universe()
+            self._ensure_daily_candidates()
+            self._refresh_hotspots()
+            self._refresh_topdown_scores()
+            self._sync_daily_lifecycle()
+        QTimer.singleShot(350, self._finish_manual_refresh_feedback)
+
+    def _finish_manual_refresh_feedback(self) -> None:
+        if self._manual_refresh_started_at is None:
+            return
+        runtime = self._quant_runtime
+        active = tuple(getattr(runtime, "active_tasks", ()) or ())
+        relevant = {
+            "universe", "daily_candidates", "hotspots", "sentiment", "topdown",
+            "lifecycle",
+        }
+        still_running = [task for task in active if task in relevant]
+        elapsed = (
+            datetime.now().astimezone() - self._manual_refresh_started_at
+        ).total_seconds()
+        if still_running and elapsed < 120:
+            friendly = {
+                "universe": "股票池", "daily_candidates": "日线候选",
+                "hotspots": "热点", "sentiment": "市场情绪",
+                "topdown": "四层评分", "lifecycle": "持仓生命周期",
+            }
+            names = "、".join(friendly.get(task, task) for task in still_running)
+            self.activity_status_label.setText(f"同步中：正在等待 {names}")
+            self.activity_status_label.setToolTip(
+                "后台任务仍在运行，完成前不会重复发起同一批同步。"
+            )
+            QTimer.singleShot(300, self._finish_manual_refresh_feedback)
+            return
+        started_at = self._manual_refresh_started_at
+        self._manual_refresh_started_at = None
+        self.header_refresh_button.setEnabled(True)
+        self.header_refresh_button.setText("立即同步")
+        self.activity_status_label.setText(
+            f"同步等待已结束 · {datetime.now().astimezone():%H:%M:%S} · "
+            "个别数据源超时，安全阻断保持有效"
+            if still_running
+            else f"同步完成 · {datetime.now().astimezone():%H:%M:%S}"
+        )
+        self.activity_status_label.setToolTip(
+            f"本次同步开始于 {started_at:%H:%M:%S}；顶部状态均来自完成后的最新快照。"
+        )
+        self._refresh_header()
 
     def _sync_current_cash_flow_page(self) -> None:
         adapter = getattr(self.ctx, "broker_adapter", None)
@@ -1241,10 +1889,18 @@ class TradeLedgerWindow(QWidget):
             return
         snapshot = self.ctx.broker_adapter.snapshot()
         self.store.add_broker_snapshot(snapshot)
-        state_text = self.store.current_strategy_state(signal.strategy_id)
+        state_strategy_id = _strategy_state_owner(signal.strategy_id)
+        state_text = self.store.current_strategy_state(state_strategy_id)
         topdown_score = None
-        if signal.strategy_id in {TOPDOWN_STRATEGY_ID, "manual_exception_4321_v1"}:
-            stored_score = self.store.latest_topdown_score(plan["symbol"])
+        if signal.strategy_id in {TOPDOWN_STRATEGY_ID, MANUAL_EXCEPTION_STRATEGY_ID}:
+            stored_score = self.store.latest_topdown_score(
+                plan["symbol"],
+                strategy_version=TOPDOWN_STRATEGY_ID,
+                scoring_version=TOPDOWN_SCORING_VERSION,
+                pool_version=str(
+                    (plan.get("risk_snapshot") or {}).get("pool_version") or ""
+                ),
+            )
             if stored_score:
                 topdown_score = TopDownScoreSnapshot.model_validate(stored_score["snapshot"])
             if topdown_score is None or not topdown_score.eligible_for_risk:
@@ -1255,7 +1911,7 @@ class TradeLedgerWindow(QWidget):
                 return
         outside_approval_valid = False
         outside_pool_position_count = 0
-        if signal.strategy_id == "manual_exception_4321_v1":
+        if signal.strategy_id == MANUAL_EXCEPTION_STRATEGY_ID:
             approval = self.store.valid_outside_pool_approval(
                 plan_id=plan_id,
                 account_fingerprint=snapshot.account_fingerprint,
@@ -1280,7 +1936,7 @@ class TradeLedgerWindow(QWidget):
             outside_approval_valid = True
             for position in snapshot.positions:
                 if any(
-                    item.get("strategy_version") == "manual_exception_4321_v1"
+                    item.get("strategy_version") == MANUAL_EXCEPTION_STRATEGY_ID
                     for item in self.store.list_plans(symbol=position.symbol)
                 ):
                     outside_pool_position_count += 1
@@ -1295,10 +1951,11 @@ class TradeLedgerWindow(QWidget):
             topdown_score=topdown_score,
             trading_channel=(
                 "outside_pool_exception"
-                if signal.strategy_id == "manual_exception_4321_v1" else "normal_pool"
+                if signal.strategy_id == MANUAL_EXCEPTION_STRATEGY_ID else "normal_pool"
             ),
             outside_pool_approval_valid=outside_approval_valid,
             outside_pool_position_count=outside_pool_position_count,
+            expected_security_name=self._expected_security_name(plan),
         )
         self.store.append_event(
             plan_id, "risk_authorization", details=risk.model_dump(mode="json")
@@ -1340,6 +1997,18 @@ class TradeLedgerWindow(QWidget):
         order = self._reconciliation_order
         if order is None:
             self._reconciliation_timer.stop()
+            return
+        plan = self.store.get_plan(order.plan_id)
+        if plan is None or str(plan.get("status") or "") == "invalidated":
+            self._reconciliation_timer.stop()
+            if self._quant_runtime is not None:
+                self._quant_runtime.end_reconciliation(order.plan_id)
+            self._reconciliation_order = None
+            self._reconciliation_matched = False
+            self.activity_status_label.setText(
+                "安全停止：计划已失效，成交对账轮询已结束；如曾手工确认，请到同花顺核查真实委托和成交。"
+            )
+            self.refresh()
             return
         self._reconciliation_attempts += 1
         try:
@@ -1394,6 +2063,7 @@ class TradeLedgerWindow(QWidget):
         plan_status = "executed_open" if status == "filled" else status
         self.store.link_broker_order(
             reconciliation,
+            account_fingerprint=snapshot.account_fingerprint,
             details={
                 "order": broker_order.model_dump(mode="json"),
                 "authorized_order": order.model_dump(mode="json"),
@@ -1406,13 +2076,23 @@ class TradeLedgerWindow(QWidget):
             plan_status=plan_status,
             event_type=event_type,
             broker_order_id=broker_order_id,
+            account_fingerprint=snapshot.account_fingerprint,
         )
         self._record_external_manual_fills(snapshot)
 
     def _refresh_linked_broker_orders(self, snapshot) -> None:
+        from pa_agent.brokers.ths_adapter import broker_fact_snapshot_gaps
         from pa_agent.trading.broker_models import ReconciliationResult
 
-        for link in self.store.list_broker_order_links():
+        gaps = broker_fact_snapshot_gaps(
+            snapshot, binding=self.ctx.settings.ths
+        )
+        if gaps:
+            return
+
+        for link in self.store.list_broker_order_links(
+            account_fingerprint=snapshot.account_fingerprint
+        ):
             broker_order = next(
                 (
                     item for item in snapshot.orders
@@ -1434,6 +2114,7 @@ class TradeLedgerWindow(QWidget):
                     matched_fill_ids=[item.broker_fill_id for item in fills if item.broker_fill_id],
                     message="周期同步更新已关联委托成交",
                 ),
+                account_fingerprint=snapshot.account_fingerprint,
                 details={
                     **link.get("details", {}),
                     "order": broker_order.model_dump(mode="json"),
@@ -1449,11 +2130,26 @@ class TradeLedgerWindow(QWidget):
                 plan_status="executed_open" if status == "filled" else status,
                 event_type=event_type,
                 broker_order_id=broker_order.broker_order_id,
+                account_fingerprint=snapshot.account_fingerprint,
             )
 
     def _manually_link_broker_order(self) -> None:
+        from pa_agent.brokers.ths_adapter import broker_fact_snapshot_gaps
+
         if self._broker_snapshot is None or self.broker_orders.currentRow() < 0:
             QMessageBox.information(self, "请选择委托", "请先同步并选择一条同花顺当日委托。")
+            return
+        fact_gaps = broker_fact_snapshot_gaps(
+            self._broker_snapshot, binding=self.ctx.settings.ths
+        )
+        if fact_gaps:
+            QMessageBox.warning(
+                self,
+                "账户事实尚未核验",
+                "不能人工关联：同花顺委托和成交尚不能作为可信事实。\n"
+                "原因：" + "；".join(fact_gaps) + "\n"
+                "下一步：确认登录的是目标账户，关闭弹窗后重新同步。",
+            )
             return
         broker_order_id = self.broker_orders.item(
             self.broker_orders.currentRow(), 0
@@ -1473,6 +2169,39 @@ class TradeLedgerWindow(QWidget):
             item for item in self._broker_snapshot.orders
             if item.broker_order_id == broker_order_id
         )
+        from pa_agent.trading.hotspot_risk import _authorized_order_from_events
+
+        authorized = _authorized_order_from_events(self.store, plan["id"])
+        mismatch_reasons: list[str] = []
+        if authorized is None:
+            mismatch_reasons.append("缺少原始风控授权订单")
+        else:
+            if broker_order.symbol != authorized.symbol:
+                mismatch_reasons.append("证券代码不一致")
+            if broker_order.direction != authorized.direction:
+                mismatch_reasons.append("买卖方向不一致")
+            if broker_order.quantity != authorized.quantity:
+                mismatch_reasons.append("委托数量不一致")
+            if abs(broker_order.price - authorized.price) > 1e-8:
+                mismatch_reasons.append("委托价格不一致")
+            try:
+                submitted = datetime.fromisoformat(broker_order.submitted_at)
+                authorized_at = datetime.fromisoformat(authorized.authorized_at)
+                if submitted.tzinfo is None or authorized_at.tzinfo is None:
+                    mismatch_reasons.append("委托时间缺少时区")
+                elif abs((submitted - authorized_at).total_seconds()) > 60:
+                    mismatch_reasons.append("委托时间超出授权窗口")
+            except (TypeError, ValueError):
+                mismatch_reasons.append("委托时间无法解析")
+            if authorized.account_fingerprint != self._broker_snapshot.account_fingerprint:
+                mismatch_reasons.append("账户指纹不一致")
+        if mismatch_reasons:
+            QMessageBox.warning(
+                self,
+                "委托不符合原计划",
+                "禁止关联：" + "；".join(mismatch_reasons),
+            )
+            return
         if broker_order.symbol != plan["symbol"] or broker_order.direction != plan["direction"]:
             QMessageBox.warning(self, "字段不一致", "委托的代码或方向与计划不一致，禁止关联。")
             return
@@ -1491,7 +2220,13 @@ class TradeLedgerWindow(QWidget):
         )
         self.store.link_broker_order(
             reconciliation,
-            details={"manual_review": True, "order": broker_order.model_dump(mode="json")},
+            account_fingerprint=self._broker_snapshot.account_fingerprint,
+            details={
+                "manual_review": True,
+                "account_fingerprint": self._broker_snapshot.account_fingerprint,
+                "order": broker_order.model_dump(mode="json"),
+                "authorized_order": authorized.model_dump(mode="json"),
+            },
         )
         status, event_type = self.ctx.broker_trade_lifecycle.broker_order_status(
             broker_order.status, broker_order.filled_quantity, broker_order.quantity
@@ -1500,6 +2235,7 @@ class TradeLedgerWindow(QWidget):
             plan_id=plan["id"], fills=fills,
             plan_status="executed_open" if status == "filled" else status,
             event_type=event_type, broker_order_id=broker_order_id,
+            account_fingerprint=self._broker_snapshot.account_fingerprint,
         )
         self.store.append_event(
             plan["id"], "manual_reconciliation_confirmed",
@@ -1508,21 +2244,24 @@ class TradeLedgerWindow(QWidget):
         self.refresh()
 
     def _record_external_manual_fills(self, snapshot) -> None:
+        from pa_agent.brokers.ths_adapter import broker_fact_snapshot_gaps
+
+        if broker_fact_snapshot_gaps(snapshot, binding=self.ctx.settings.ths):
+            return
         # A just-prefilled order may appear between the 2-second reconciliation ticks.
         # Wait until its bounded reconciliation window ends before classifying unknown fills.
         if self._reconciliation_order is not None:
             return
-        linked = self.store.linked_broker_fill_ids()
-        pending_matches = {
-            (item["symbol"], item["direction"])
-            for item in self.store.list_plans(
-                statuses=["awaiting_user_confirmation", "reconciliation_required"]
-            )
-        }
+        linked = self.store.linked_broker_fill_ids(
+            account_fingerprint=snapshot.account_fingerprint
+        )
+        from pa_agent.trading.hotspot_risk import pending_reconciliation_order_ids
+
+        protected_order_ids = pending_reconciliation_order_ids(self.store, snapshot)
         for fill in snapshot.fills:
             if not fill.broker_fill_id or fill.broker_fill_id in linked:
                 continue
-            if (fill.symbol, fill.direction) in pending_matches:
+            if fill.broker_order_id in protected_order_ids:
                 continue
             if self.store.add_external_broker_trade(
                 fill, account_fingerprint=snapshot.account_fingerprint
@@ -1541,7 +2280,11 @@ class TradeLedgerWindow(QWidget):
         if not health["available"]:
             return
         plans = self.store.list_plans()
-        score_records = self.store.list_topdown_scores(limit=1000)
+        score_records = self.store.list_topdown_scores(
+            strategy_version=TOPDOWN_STRATEGY_ID,
+            scoring_version=TOPDOWN_SCORING_VERSION,
+            limit=1000,
+        )
         scores_by_symbol: dict[str, dict] = {}
         for record in score_records:
             scores_by_symbol.setdefault(record["symbol"], record["snapshot"])
@@ -1578,11 +2321,14 @@ class TradeLedgerWindow(QWidget):
         for plan in plans:
             plans_by_symbol.setdefault(plan["symbol"], plan)
         universe_rows = []
+        hotspot_covered = 0
         for rank, symbol in enumerate(members, 1):
             score = scores_by_symbol.get(symbol) or {}
             plan = plans_by_symbol.get(symbol) or {}
             hotspot = self.store.latest_hotspot_snapshot(symbol)
             hotspot_data = (hotspot or {}).get("snapshot") or {}
+            if hotspot_data:
+                hotspot_covered += 1
             themes = hotspot_data.get("concepts") or hotspot_data.get("industries") or []
             titles = [item.get("title", "") for item in hotspot_data.get("items", [])[:1]]
             blocks = score.get("hard_blocks") or score.get("data_gaps") or []
@@ -1630,7 +2376,8 @@ class TradeLedgerWindow(QWidget):
                     f"{current_universe.get('version', '')} | 基础池 {len(members)}只 | "
                     f"日线扫描 {len(latest_daily_signals)}只 | "
                     f"今日候选 {len(daily_allowed)}只 | "
-                    f"固定成员日期 {current_universe.get('source_as_of', '—')} | "
+                    f"热点监控 {hotspot_covered}/{len(members)}只 | "
+                    f"版本生效 {current_universe.get('source_as_of', '—')} | "
                     f"数据更新时间 {record.get('source_updated_at', '—')}"
                 )
             else:
@@ -1657,14 +2404,20 @@ class TradeLedgerWindow(QWidget):
         self.universe_tabs.setTabText(1, f"今日候选（{len(candidate_rows)}）")
         self.candidate_empty_label.setVisible(not candidate_rows)
         if not candidate_rows:
-            scan_text = (
-                f"已扫描 {len(latest_daily_signals)}只，全部未通过当前日线买点条件。"
-                if latest_daily_signals else "日线候选扫描尚未完成。"
-            )
-            self.candidate_empty_label.setText(
-                f"基础池有 {len(members)}只；今日候选 0只。{scan_text}"
-                "这不是股票池无数据，系统不会为凑候选而放宽策略。"
-            )
+            if not members:
+                self.candidate_empty_label.setText(
+                    "当前私人A股股票池为空。请在上方输入6位代码或完整股票名称新增，"
+                    "系统将在校验通过后开始日线扫描、热点采集和15分钟监控。"
+                )
+            else:
+                scan_text = (
+                    f"已扫描 {len(latest_daily_signals)}只，全部未通过当前日线买点条件。"
+                    if latest_daily_signals else "日线候选扫描尚未完成。"
+                )
+                self.candidate_empty_label.setText(
+                    f"基础池有 {len(members)}只；今日候选 0只。{scan_text}"
+                    "这不是股票池无数据，系统不会为凑候选而放宽策略。"
+                )
         rejected = current_universe.get("rejected") or {}
         self._fill(self.excluded_table, [[
             symbol, ", ".join(reasons), current_universe.get("version", ""),
@@ -1674,6 +2427,8 @@ class TradeLedgerWindow(QWidget):
             item["snapshot"].get("version", item.get("version", "")),
             item.get("as_of", ""), len(item["snapshot"].get("symbols") or []),
             len(item["snapshot"].get("rejected") or {}),
+            item["snapshot"].get("change_summary") or "初始/历史快照",
+            item["snapshot"].get("parent_version") or "—",
             "完整" if item.get("data_complete") else "数据不完整",
             item.get("source_updated_at", ""),
         ] for item in universes])
@@ -1803,17 +2558,33 @@ class TradeLedgerWindow(QWidget):
     def _refresh_header(self) -> None:
         state = getattr(getattr(self.ctx, "broker_adapter", None), "connection", None)
         usable = bool(state and state.usable)
+        binding_confirmed = bool(getattr(self.ctx.settings.ths, "confirmed", False))
+        broker_snapshot_complete = bool(
+            self._broker_snapshot and self._broker_snapshot.complete
+        )
         masked = getattr(self.ctx.settings.ths, "masked_account", "") or "未确认账户"
         strategy_state = self.store.current_strategy_state(TOPDOWN_STRATEGY_ID) if self.store.available else "candidate"
         universes = self.store.list_universe_snapshots(limit=1) if self.store.available else []
         universe = universes[0]["snapshot"] if universes else {}
         pool_version = universe.get("version") or "股票池未加载"
         captured = self._broker_snapshot.captured_at if self._broker_snapshot else "尚未同步"
+        broker_label = _broker_connection_label(
+            state,
+            binding_confirmed=binding_confirmed,
+            snapshot_complete=broker_snapshot_complete,
+        )
         self.system_status_line.setText(
-            f"同花顺 ● {'已连接' if usable else '未就绪'} | 账户 {masked} | 策略 {strategy_state.upper()} | "
+            f"同花顺 ● {broker_label} | 账户 {masked} | 策略 {strategy_state.upper()} | "
             f"股票池 {pool_version} | 最近同步 {captured}"
         )
-        score_record = self.store.latest_topdown_score() if self.store.available else None
+        score_record = (
+            self.store.latest_topdown_score(
+                strategy_version=TOPDOWN_STRATEGY_ID,
+                scoring_version=TOPDOWN_SCORING_VERSION,
+            )
+            if self.store.available
+            else None
+        )
         score = (score_record or {}).get("snapshot") or {}
         for key, maximum in (("index", 40), ("sentiment", 30), ("theme", 20), ("stock", 10)):
             self.score_labels[key].setText(f"{_score_name(key)} {_score_text(score.get(key + '_score'), maximum)}")
@@ -1829,7 +2600,99 @@ class TradeLedgerWindow(QWidget):
                 "border-radius:4px; padding:5px 10px; font-weight:700;"
             )
             self.total_score_label.setText(
-                f"综合 {float(total):.1f}/100 | 连续{score.get('consecutive_pass_count', 0)}根 | {score.get('status', '')}"
+                f"综合 {float(total):.1f}/100 | 连续{score.get('consecutive_pass_count', 0)}根 | "
+                f"{_topdown_status_label(str(score.get('status') or ''))}"
+            )
+        if not usable:
+            broker_reason = (
+                getattr(state, "message", "")
+                or _broker_connection_label(
+                    state,
+                    binding_confirmed=binding_confirmed,
+                    snapshot_complete=broker_snapshot_complete,
+                )
+            )
+            self._set_experience_guidance(
+                happened="同花顺尚未达到可读取账户数据的状态，实盘和预填保持关闭。",
+                reason=broker_reason,
+                next_step=(
+                    "请由你本人完成同花顺行情端和交易端登录，再到“同花顺与账户”检测；"
+                    "系统不会输入密码或验证码。"
+                ),
+                action="broker",
+                action_text="去同花顺与账户",
+            )
+        elif not binding_confirmed:
+            self._set_experience_guidance(
+                happened="已检测到同花顺客户端，但目标资金账户还没有由你确认。",
+                reason="系统不能猜测交易账户；账户指纹未确认前禁止预填。",
+                next_step="核对券商和脱敏资金账号，确认这是目标账户。",
+                action="broker",
+                action_text="核对目标账户",
+            )
+        elif not broker_snapshot_complete:
+            incomplete = []
+            if self._broker_snapshot is not None:
+                for complete, label in (
+                    (self._broker_snapshot.positions_complete, "持仓"),
+                    (self._broker_snapshot.orders_complete, "当日委托"),
+                    (self._broker_snapshot.fills_complete, "当日成交"),
+                ):
+                    if not complete:
+                        incomplete.append(label)
+            self._set_experience_guidance(
+                happened="账户已绑定，但账户事实表还没有全部核验，预填继续关闭。",
+                reason=(
+                    "未完成回读：" + "、".join(incomplete)
+                    if incomplete else "资金、持仓、委托或成交快照仍不完整。"
+                ),
+                next_step="保持交易端已登录并立即同步；事实表完整前不会授权订单。",
+                action="refresh",
+                action_text="立即重新同步",
+            )
+        elif strategy_state not in {
+            StrategyState.ACTIVE.value,
+            StrategyState.REDUCED.value,
+        }:
+            self._set_experience_guidance(
+                happened=f"账户只读链路可用，但策略仍处于 {strategy_state.upper()}，当前只观察。",
+                reason="可信样本外和正式影子交易证据尚未达到实盘晋级门槛。",
+                next_step="到“策略验证”查看缺口并继续积累真实验证证据。",
+                action="validation",
+                action_text="查看策略验证",
+            )
+        elif total is None:
+            gaps = score.get("data_gaps") or score.get("hard_blocks") or []
+            self._set_experience_guidance(
+                happened="当前四层综合分无效，系统没有生成交易授权。",
+                reason=("；".join(str(item) for item in gaps[:3]) or "评分输入尚未完整或已过期。"),
+                next_step="立即同步并等待日线候选、热点、情绪和15分钟数据完整；缺失项不会按0分处理。",
+                action="refresh",
+                action_text="立即重新同步",
+            )
+        elif float(total) < 70:
+            self._set_experience_guidance(
+                happened=f"最新综合分为 {float(total):.1f}/100，当前没有进入组合风控。",
+                reason="综合分未达到70分放行线，或仍存在不可绕过的硬门槛。",
+                next_step="继续观察；达到70分且连续两根15分钟确认后才会进入组合风控。",
+                action="universe",
+                action_text="查看候选与原因",
+            )
+        elif int(score.get("consecutive_pass_count") or 0) < 2:
+            self._set_experience_guidance(
+                happened=f"最新综合分为 {float(total):.1f}/100，已达到放行线但尚未完成连续确认。",
+                reason="策略要求连续两根已收盘15分钟K线达到门槛，避免盘中瞬时信号。",
+                next_step="等待下一根15分钟K线收盘；若总分跌回门槛下方，连续计数会重置。",
+                action="today",
+                action_text="查看今日行动",
+            )
+        else:
+            self._set_experience_guidance(
+                happened="四层评分已连续确认，可以进入组合风控核验。",
+                reason="评分通过只代表允许送审，资金、持仓、价格和组合风险仍需再次授权。",
+                next_step="进入“交易计划”核对授权状态；只有全部风控通过的计划才能安全预填。",
+                action="plans",
+                action_text="查看交易计划",
             )
 
     def _refresh_actions(self, plans: list[dict], scores: dict[str, dict]) -> None:
@@ -1852,23 +2715,51 @@ class TradeLedgerWindow(QWidget):
             score = scores.get(plan["symbol"]) or {}
             blocks = score.get("hard_blocks") or score.get("data_gaps") or []
             events = self.store.list_events(plan["id"])
+            action_event = next((
+                event for event in reversed(events)
+                if event.get("event_type") in {
+                    "major_negative_action_required",
+                    "topdown_revocation_action_required",
+                }
+            ), None)
             has_t1_risk = any(
                 event.get("event_type") == "t1_locked_breach" for event in events
             )
-            next_step = (
+            if action_event is not None:
+                details = action_event.get("details") or {}
+                event_type = str(action_event.get("event_type") or "")
+                issue = (
+                    "重大负面事件，真实委托/成交待核查"
+                    if event_type == "major_negative_action_required"
+                    else "交易授权已撤销，真实委托/成交待核查"
+                )
+                next_step = str(details.get("required_action") or "立即核查同花顺真实委托和成交")
+                event_blocks = (
+                    details.get("negative_blocks")
+                    or details.get("hard_blocks")
+                    or details.get("data_gaps")
+                    or []
+                )
+                block_text = ", ".join(str(item) for item in event_blocks[:3]) or "券商事实尚未确认"
+                row_priority = 1
+            else:
+                issue = _strategy_label(plan.get("strategy_version", ""))
+                next_step = (
                 "处理退出" if status == "exit_detected" else
                 "T+1锁定，下一交易日优先处理" if has_t1_risk else
                 "人工对账" if status == "reconciliation_required" else
                 "在同花顺确认" if status == "awaiting_user_confirmation" else
                 "核对并预填" if score.get("status") == "eligible_for_risk" else
                 "等待15分钟评分确认"
-            )
+                )
+                block_text = ", ".join(blocks[:3]) or "—"
+                row_priority = 3 if has_t1_risk else priority.get(status, 8)
             rows.append([
-                3 if has_t1_risk else priority.get(status, 8),
+                row_priority,
                 f"{plan['symbol']} {self._broker_name_for(plan['symbol'])}",
-                _strategy_label(plan.get("strategy_version", "")),
+                issue,
                 _score_text(score.get("total_score"), 100), status, next_step,
-                ", ".join(blocks[:3]) or "—",
+                block_text,
             ])
         rows.sort(key=lambda item: item[0])
         self._fill(self.action_table, rows)
@@ -1959,14 +2850,26 @@ class TradeLedgerWindow(QWidget):
         self.risk_status_line.setText(
             f"本月收益 {'—' if trusted_monthly is None else f'{trusted_monthly:+.2f}%'} | "
             f"高点回撤 {'—' if peak_drawdown is None else f'{peak_drawdown:.2f}%'} | "
+            f"{_monthly_risk_mode(trusted_monthly, peak_drawdown, portfolio)} | "
             f"开放风险 —/{effective_max_open:.2f}%（{risk_stage}） | "
             f"持仓 {position_count}/{portfolio.max_positions} | "
             f"待处理 {self.action_table.rowCount()}"
         )
 
     def _refresh_validation(self) -> None:
+        registry = getattr(self.ctx, "validation_epochs", None)
+        epoch = registry.require_current() if registry is not None else None
         state = self.store.current_strategy_state(TOPDOWN_STRATEGY_ID)
-        scores = self.store.list_topdown_scores(limit=1000)
+        scores = self.store.list_topdown_scores(
+            strategy_version=TOPDOWN_STRATEGY_ID,
+            scoring_version=TOPDOWN_SCORING_VERSION,
+            limit=1000,
+        )
+        if epoch is not None and epoch.is_private_pool:
+            scores = [
+                item for item in scores
+                if str(item.get("pool_version") or "") in epoch.pool_versions
+            ]
         eligible = sum(1 for item in scores if item["status"] == "eligible_for_risk")
         validation_runs = self.store.list_validation_runs(
             strategy_version=TOPDOWN_STRATEGY_ID,
@@ -1979,17 +2882,35 @@ class TradeLedgerWindow(QWidget):
         fixed_report = (fixed or {}).get("report") or {}
         fixed_checks = fixed_report.get("checks") or []
         fixed_passed = sum(bool(item.get("passed")) for item in fixed_checks)
+        def current_epoch_run(item: dict) -> bool:
+            if epoch is None or not epoch.is_private_pool:
+                return True
+            report = item.get("report") or {}
+            return (
+                str(report.get("validation_epoch_id") or "") == epoch.epoch_id
+                and str(report.get("member_hash") or "") == epoch.member_hash
+                and str(report.get("pool_version") or "") in epoch.pool_versions
+            )
+
         promotion_runs = [
-            item for item in validation_runs if item.get("promotion_eligible")
+            item for item in validation_runs
+            if item.get("promotion_eligible") and current_epoch_run(item)
         ]
         oos_bundle = next(
             (
                 item for item in validation_runs
                 if item.get("dataset") == "out_of_sample_data_bundle"
+                and current_epoch_run(item)
             ),
             None,
         )
         oos_bundle_report = (oos_bundle or {}).get("report") or {}
+        oos_bundle_summary = (
+            f"{oos_bundle_report.get('status', '校验状态未知')} | "
+            f"缺口 {len(oos_bundle_report.get('data_gaps') or [])}项"
+            if oos_bundle_report
+            else "尚未导入 | 等待选择并校验数据包"
+        )
         persisted_bundle_path = str(oos_bundle_report.get("bundle_path") or "")
         if (
             not self._validated_oos_bundle_path
@@ -2002,11 +2923,24 @@ class TradeLedgerWindow(QWidget):
             (
                 item for item in validation_runs
                 if item.get("dataset") == "out_of_sample"
+                and current_epoch_run(item)
             ),
             None,
         )
         oos_backtest_report = (oos_backtest or {}).get("report") or {}
         oos_evidence = oos_backtest_report.get("performance_evidence") or {}
+        oos_backtest_has_run = bool(oos_backtest_report)
+        oos_backtest_trade_count = (
+            str(oos_evidence.get("trade_count", 0)) if oos_backtest_has_run else "—"
+        )
+        oos_backtest_data_gaps = (
+            ", ".join(oos_backtest_report.get("data_gaps") or []) or "无"
+            if oos_backtest_has_run else "尚未评估（等待有效数据包）"
+        )
+        oos_backtest_gate_failures = (
+            ", ".join(oos_backtest_report.get("gate_failures") or []) or "无"
+            if oos_backtest_has_run else "尚未评估（回测尚未运行）"
+        )
         self.run_oos_button.setEnabled(
             bool(
                 self._validated_oos_bundle_path
@@ -2018,6 +2952,44 @@ class TradeLedgerWindow(QWidget):
             )
         )
         sentiment_days = self.store.market_daily_price_dates(limit=30)
+        history_runs = self.store.list_validation_runs(
+            strategy_version="market_sentiment_history_v1",
+            limit=1,
+        )
+        history_report = (history_runs[0].get("report") or {}) if history_runs else {}
+        history_coverage = history_report.get("coverage_by_date") or {}
+        history_min_coverage = min(history_coverage.values()) if history_coverage else 0
+        oos_coverage = self.store.oos_observation_coverage(
+            strategy_version=(
+                epoch.observation_strategy_version
+                if epoch is not None else TOPDOWN_STRATEGY_ID
+            )
+        )
+        from pa_agent.trading.oos_export import OosObservationExporter
+
+        production_audit = OosObservationExporter(
+            self.store, validation_epochs=registry
+        ).audit()
+        self._production_oos_audit = production_audit
+        production_busy = bool(
+            self._production_oos_thread is not None
+            and self._production_oos_thread.isRunning()
+        )
+        self.audit_production_oos_button.setEnabled(not production_busy)
+        self.export_production_oos_button.setEnabled(
+            production_audit.export_ready and not production_busy
+        )
+        self.export_production_oos_button.setToolTip(
+            "覆盖审核已通过。点击选择保存位置；导出后仍会校验来源时间、哈希和数据包结构。"
+            if production_audit.export_ready
+            else "暂不可导出："
+            + self._friendly_oos_gaps(production_audit.data_gaps, limit=5)
+        )
+        required_oos_kinds = {
+            "historical_constituents", "daily_bars", "intraday_15m",
+            "market_sentiment", "hotspots",
+        }
+        missing_oos_kinds = sorted(required_oos_kinds - set(oos_coverage))
         historical_pool_count = sum(
             1
             for item in self.store.list_universe_snapshots(limit=120)
@@ -2025,7 +2997,9 @@ class TradeLedgerWindow(QWidget):
             == "historical_constituents"
         )
         shadow_evidence, shadow_gaps = build_shadow_performance_evidence(
-            self.store, strategy_id=TOPDOWN_STRATEGY_ID
+            self.store,
+            strategy_id=TOPDOWN_STRATEGY_ID,
+            validation_epochs=registry,
         )
         shadow_transition = self.ctx.strategy_stability.evaluate(
             StrategyState.SHADOW, shadow_evidence
@@ -2051,29 +3025,109 @@ class TradeLedgerWindow(QWidget):
         shadow_pf_text = "—" if shadow_pf is None else (
             "∞" if shadow_pf == float("inf") else f"{shadow_pf:.2f}"
         )
+        setup_exclusions = production_audit.non_scoreable_setup_records
+        setup_exclusion_labels = {
+            "intraday_15m": "15分钟行情",
+            "market_sentiment": "市场情绪",
+            "hotspots": "热点信息",
+        }
+        setup_exclusion_text = (
+            "、".join(
+                f"{setup_exclusion_labels.get(kind, kind)} {count}条"
+                for kind, count in sorted(setup_exclusions.items())
+            )
+            if setup_exclusions else "无"
+        )
+        epoch_summary = ""
+        if epoch is not None:
+            first_score_text = (
+                "第65个完整日线交易日后的下一交易日"
+                if production_audit.session_count < 65
+                else "日线热身已完成，等待完整15分钟评分槽"
+            )
+            epoch_summary = (
+                f"当前验证纪元：{epoch.epoch_id}\n"
+                f"- 绑定股票池：{epoch.pool_version}\n"
+                f"- 成员哈希：{epoch.member_hash}\n"
+                f"- 成员：{len(epoch.symbols)}只 | 可授权成员："
+                f"{len(epoch.authorization_symbols)}只\n"
+                f"- 激活时间：{epoch.activated_at}\n"
+                f"- 日线热身：{production_audit.session_count}/65个真实交易日\n"
+                f"- 首个可评分日期：{first_score_text}\n"
+                "- 成员增删会新建纪元；行情刷新不会继承或清空验证成绩。\n\n"
+            )
+        production_summary = (
+            epoch_summary
+            +
+            "生产 OOS 完整性审核："
+            + ("可安全导出" if production_audit.export_ready else "尚不可导出")
+            + f" | 日线交易日 {production_audit.session_count}/65"
+            + f" | 完整15分钟槽 {production_audit.complete_intraday_slots}\n"
+            + f"- 发生了什么：系统逐时点核对当前{len(epoch.symbols) if epoch else 0}只股票、4个指数、情绪和逐股热点，不把缺失值当成0。\n"
+            + f"- 热身期非评分旧记录：{setup_exclusion_text}（原始账本保留，安全导出时确定性排除）。\n"
+            + "- 为什么：只有完整、可追溯且没有未来数据的原始观察，才允许打包进入样本外回测。\n"
+            + (
+                "- 下一步：点击“导出生产 OOS 数据包”，再运行组合样本外回测；数据包本身不构成晋级证据。\n\n"
+                if production_audit.export_ready
+                else "- 下一步：继续积累真实闭合K线；当前缺口："
+                + self._friendly_oos_gaps(production_audit.data_gaps, limit=8)
+                + "\n\n"
+            )
+        )
         self.validation_summary.setPlainText(
+            production_summary
+            +
             f"当前策略：{TOPDOWN_STRATEGY_ID}\n"
             f"当前状态：{state.upper()}\n"
             f"冻结15分钟评分快照：{len(scores)}\n"
             f"达到连续确认并可进入风控：{eligible}\n\n"
             f"固定机制回放：{fixed_report.get('status', '尚未运行')} | "
             f"通过 {fixed_passed}/{len(fixed_checks)} 项 | 不可用于晋级\n"
-            f"历史沪深300股票池版本：{historical_pool_count}个\n"
-            f"市场情绪日级历史积累：{len(sentiment_days)}/20个完整交易日\n"
+            f"旧沪深300历史审计池版本：{historical_pool_count}个（不可用于当前策略晋级）\n"
+            f"市场情绪日级历史积累：{len(sentiment_days)}/21个真实交易日\n"
+            "真实全A历史回填："
+            f"{history_report.get('status', '尚未运行')} | "
+            f"交易日 {len(history_report.get('session_dates') or [])}/21 | "
+            f"最低单日覆盖 {history_min_coverage}/3000 | "
+            f"完整股票 {history_report.get('completed_symbols', 0)}/"
+            f"{history_report.get('universe_count', 0)} | "
+            f"本批处理 {history_report.get('processed_symbols', 0)} | "
+            f"本批新增完整 {history_report.get('newly_completed_symbols', 0)} | "
+            f"待补齐 {history_report.get('remaining_symbols', 0)}\n"
+            "- 发生了什么：系统分批保存东方财富真实未复权收盘价，不阻塞当前窗口。\n"
+            + (
+                "- 当前结果：21个交易日均达到每日至少3000只真实价格覆盖，情绪历史基线已就绪。\n"
+                if history_report.get("status") == "complete" and history_min_coverage >= 3000
+                else "- 为什么仍阻断：任一交易日覆盖不足3000只，都不能计算可信的新高/新低情绪。\n"
+            )
+            + (
+                "- 下一步：无需继续补齐无完整21日数据的代码；继续积累真实OOS观察。\n"
+                if history_report.get("status") == "complete" and history_min_coverage >= 3000
+                else "- 下一步：后台会受控分批自动续传；也可点击补齐按钮继续上次进度。不会复制或伪造历史。\n"
+            )
+            + "生产OOS原始观察账本（只追加、不得事后挑样本）：\n"
+            + "".join(
+                f"- {kind}: {details.get('record_count', 0)}条 | "
+                f"{details.get('symbols', 0)}个标的 | "
+                f"{details.get('period_start', '—')} → {details.get('period_end', '—')}\n"
+                for kind, details in sorted(oos_coverage.items())
+            )
+            + f"- 尚未采集的必要数据类型：{', '.join(missing_oos_kinds) or '无'}\n"
+            + "- 说明：盘前不会生成15分钟记录；只有真实K线闭合后才写入。账本完整前禁止导出晋级包。\n"
+            +
             f"可用于晋级的样本外/影子验证记录：{len(promotion_runs)}条\n\n"
-            f"样本外数据包：{oos_bundle_report.get('status', '尚未导入')} | "
-            f"缺口 {len(oos_bundle_report.get('data_gaps') or [])}项 | "
+            f"当前策略样本外数据包 v2：{oos_bundle_summary} | "
             "数据包本身不可用于晋级\n\n"
             "日线+15分钟组合样本外回测："
             f"{oos_backtest_report.get('status', '尚未运行')} | "
-            f"交易 {oos_evidence.get('trade_count', 0)}/200笔 | "
+            f"交易 {oos_backtest_trade_count}/200笔 | "
             f"期望R {oos_evidence.get('expectancy_r', '—')} | "
             f"PF {oos_evidence.get('profit_factor', '—')} | "
             f"最大回撤 {oos_evidence.get('max_drawdown_pct', '—')}% | "
             f"盈利月份比例 {oos_evidence.get('profitable_month_ratio', '—')}\n"
-            f"- 晋级结果：{'可进入SHADOW' if (oos_backtest or {}).get('promotion_eligible') else '未达到门槛'}\n"
-            f"- 数据缺口：{', '.join(oos_backtest_report.get('data_gaps') or []) or '无'}\n"
-            f"- 门槛缺口：{', '.join(oos_backtest_report.get('gate_failures') or []) or '无'}\n\n"
+            f"- 晋级结果：{'可进入SHADOW' if (oos_backtest or {}).get('promotion_eligible') else ('未达到门槛' if oos_backtest_has_run else '尚未评估')}\n"
+            f"- 数据缺口：{oos_backtest_data_gaps}\n"
+            f"- 门槛缺口：{oos_backtest_gate_failures}\n\n"
             "影子交易晋级门槛（系统从真实shadow结果自动计算）：\n"
             f"- 交易笔数：{shadow_evidence.trade_count}/80\n"
             f"- 观察周期：{shadow_evidence.weeks:.2f}/12周\n"
@@ -2088,12 +3142,153 @@ class TradeLedgerWindow(QWidget):
             "不得启用真实交易；池外例外交易不计入策略晋级样本。"
         )
 
+    @staticmethod
+    def _friendly_oos_gaps(gaps: list[str], *, limit: int = 8) -> str:
+        labels = {
+            "observation_kind_missing:daily_bars": "缺少日线原始观察",
+            "observation_kind_missing:intraday_15m": "缺少闭合15分钟K线",
+            "observation_kind_missing:market_sentiment": "缺少完整市场情绪",
+            "observation_kind_missing:hotspots": "缺少逐股热点快照",
+            "intraday_observations_missing": "尚未形成盘中15分钟观察",
+            "complete_intraday_slots_missing": "尚无完整15分钟评分槽",
+        }
+        translated: list[str] = []
+        for gap in gaps:
+            if gap in labels:
+                value = labels[gap]
+            elif gap.startswith("daily_warmup_sessions_insufficient:"):
+                value = "日线热身交易日不足（" + gap.rsplit(":", 1)[-1] + "）"
+            elif gap.startswith("daily_session_incomplete:"):
+                value = "日线标的覆盖不完整"
+            elif gap.startswith("intraday_slot_incomplete:"):
+                value = "15分钟槽标的覆盖不完整"
+            elif gap.startswith("sentiment_"):
+                value = "15分钟市场情绪缺失或字段不完整"
+            elif gap.startswith("hotspot_"):
+                value = "逐股热点时点覆盖不完整"
+            elif gap.startswith("theme_fields_missing:"):
+                value = "题材板块指标不完整"
+            elif gap.startswith("constituents_"):
+                value = "固定11股策略定义不完整或不唯一"
+            else:
+                value = gap
+            if value not in translated:
+                translated.append(value)
+        shown = translated[:limit]
+        if len(translated) > limit:
+            shown.append(f"另有{len(translated) - limit}类缺口")
+        return "、".join(shown) or "无"
+
+    def _audit_production_oos(self) -> None:
+        self._start_production_oos_operation("audit")
+
+    def _export_production_oos(self) -> None:
+        if not self.export_production_oos_button.isEnabled():
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存生产 OOS 数据包",
+            "pa-production-oos-v2.zip",
+            "PA OOS Bundle (*.zip)",
+        )
+        if filename:
+            self._start_production_oos_operation("export", Path(filename))
+
+    def _start_production_oos_operation(
+        self, mode: str, destination: Path | None = None
+    ) -> None:
+        if self._production_oos_thread is not None:
+            return
+        from pa_agent.trading.oos_export import OosObservationExporter
+
+        self.audit_production_oos_button.setEnabled(False)
+        self.export_production_oos_button.setEnabled(False)
+        self.audit_production_oos_button.setText(
+            "正在审核生产 OOS…" if mode == "audit" else "正在安全导出…"
+        )
+        thread = QThread(self)
+        worker = _ProductionOosWorker(
+            OosObservationExporter(
+                self.store,
+                validation_epochs=getattr(self.ctx, "validation_epochs", None),
+            ),
+            mode=mode,
+            destination=destination,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._production_oos_finished)
+        worker.failed.connect(self._production_oos_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._production_oos_thread_finished)
+        self._production_oos_thread = thread
+        self._production_oos_worker = worker
+        thread.start()
+
+    def _production_oos_finished(self, mode: str, result: object) -> None:
+        if mode == "audit":
+            self._production_oos_audit = result
+            self.store.add_validation_run(
+                result,
+                dataset="production_oos_coverage",
+                promotion_eligible=False,
+            )
+            if result.export_ready:
+                QMessageBox.information(
+                    self,
+                    "生产 OOS 覆盖审核通过",
+                    "原始账本已满足安全导出条件。下一步可导出数据包并运行组合样本外回测；导出不会自动晋级策略。",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "生产 OOS 仍在积累",
+                    "当前不能导出。\n缺口："
+                    + self._friendly_oos_gaps(result.data_gaps, limit=10),
+                )
+        else:
+            self._validated_oos_bundle_path = str(Path(result).resolve())
+            QMessageBox.information(
+                self,
+                "生产 OOS 数据包已安全导出",
+                f"已保存：{result}\n系统已再次校验数据包结构、来源时间与哈希。下一步仍需运行样本外回测并达到不少于200笔等晋级门槛。",
+            )
+
+    def _production_oos_failed(self, _mode: str, error: str) -> None:
+        QMessageBox.warning(
+            self,
+            "生产 OOS 操作未完成",
+            "系统没有交付不完整数据包。\n" + error,
+        )
+
+    def _production_oos_thread_finished(self) -> None:
+        self._production_oos_thread = None
+        self._production_oos_worker = None
+        self.audit_production_oos_button.setText("审核生产 OOS 覆盖")
+        self.refresh()
+
     def _approve_small_live(self) -> None:
         if not self.small_live_button.isEnabled():
             QMessageBox.warning(
                 self,
                 "暂不能批准",
                 "影子交易门槛、历史证据或同花顺账户绑定尚未全部完成。",
+            )
+            return
+        from pa_agent.brokers.ths_adapter import broker_fact_snapshot_gaps
+
+        fact_gaps = broker_fact_snapshot_gaps(
+            self._broker_snapshot, binding=self.ctx.settings.ths
+        )
+        if fact_gaps:
+            QMessageBox.warning(
+                self,
+                "事实表不可信",
+                "当前账户、委托或成交事实表不完整，禁止人工关联。请先重新同步："
+                + ", ".join(fact_gaps),
             )
             return
         answer = QMessageBox.question(
@@ -2114,7 +3309,8 @@ class TradeLedgerWindow(QWidget):
             acknowledgment_version="small_live_v1",
         )
         service = getattr(self.ctx, "strategy_promotion", None) or StrategyPromotionService(
-            self.store
+            self.store,
+            validation_epochs=getattr(self.ctx, "validation_epochs", None),
         )
         try:
             service.activate_small_live(approval)
@@ -2147,15 +3343,24 @@ class TradeLedgerWindow(QWidget):
             promotion_eligible=False,
         )
         self._validated_oos_bundle_path = (
-            str(Path(filename).resolve()) if report.status == "complete" else ""
+            str(Path(filename).resolve())
+            if report.status == "complete"
+            and report.strategy_version == TOPDOWN_STRATEGY_ID
+            else ""
         )
         self.refresh()
-        if report.status == "complete":
+        if report.status == "complete" and report.strategy_version == TOPDOWN_STRATEGY_ID:
             QMessageBox.information(
                 self,
                 "数据包校验通过",
-                "历史成分、日线、15分钟、情绪和热点文件的来源时间与哈希校验通过。"
+                "冻结云算力11股定义、日线、15分钟、情绪和热点文件的来源时间与哈希校验通过。"
                 "数据包本身不能晋级；仍需运行联合回测并达到不少于200笔的绩效门槛。",
+            )
+        elif report.status == "complete":
+            QMessageBox.warning(
+                self,
+                "仅保存为历史审计",
+                "这是旧沪深300策略数据包，已保存审计记录，但不能运行当前云算力策略回测或晋级。",
             )
         else:
             QMessageBox.warning(
@@ -2194,7 +3399,8 @@ class TradeLedgerWindow(QWidget):
 
     def _oos_backtest_finished(self, report) -> None:
         service = getattr(self.ctx, "strategy_promotion", None) or StrategyPromotionService(
-            self.store
+            self.store,
+            validation_epochs=getattr(self.ctx, "validation_epochs", None),
         )
         try:
             service.record_out_of_sample_report(report)
@@ -2238,28 +3444,88 @@ class TradeLedgerWindow(QWidget):
                     return position.name
         return ""
 
+    def _expected_security_name(self, plan: dict) -> str:
+        """Read the plan's expected identity from the current persisted pool."""
+        symbol = str(plan.get("symbol") or "")
+        plan_name = str(
+            (plan.get("risk_snapshot") or {}).get("expected_security_name") or ""
+        ).strip()
+        if plan_name:
+            return plan_name
+        if not self.store.available:
+            return ""
+        universes = self.store.list_universe_snapshots(limit=1)
+        snapshot = universes[0].get("snapshot", {}) if universes else {}
+        for member in snapshot.get("members") or []:
+            if str(member.get("symbol") or "").zfill(6) == symbol.zfill(6):
+                return str(member.get("name") or "").strip()
+        return ""
+
     def _load_stock_detail(self) -> None:
         raw = self.stock_symbol.text().strip()
         if not raw:
+            self.stock_symbol.setFocus()
+            self.stock_symbol.setPlaceholderText("请先输入6位A股代码或股票名称")
             return
+        from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+        universes = self.store.list_universe_snapshots(limit=1) if self.store.available else []
+        universe_record = universes[0] if universes else {}
+        current_pool = universe_record.get("snapshot") or {}
+        current_pool_version = str(current_pool.get("version") or "")
+
         symbol = raw
         if not raw.isdigit():
             try:
-                from pa_agent.data.tv_symbol_lookup import resolve_tv_symbol_name
+                from pa_agent.data.eastmoney_client import resolve_a_share_stock_name
 
-                _, symbol = resolve_tv_symbol_name(raw)
+                exchange, symbol = resolve_a_share_stock_name(
+                    raw,
+                    preferred_members=current_pool.get("members") or [],
+                )
             except Exception as exc:  # noqa: BLE001
-                self._show_stock_profile_error(raw, str(exc))
+                self._show_stock_query_error(raw, str(exc))
                 return
-        symbol = symbol[-6:].zfill(6)
+            if exchange not in {"SSE", "SZSE", "BSE", "BJSE"}:
+                self._show_stock_query_error(
+                    raw,
+                    "当前仅支持A股股票名称，港美股和其他市场暂不开放",
+                )
+                return
+        if len(symbol) != 6 or not is_a_share_stock_symbol(symbol):
+            self._show_stock_query_error(
+                raw,
+                "请输入6位A股股票代码；指数、基金、债券及其他市场暂不开放",
+            )
+            return
         self.stock_symbol.setText(symbol)
-        score_record = self.store.latest_topdown_score(symbol) if self.store.available else None
+        self.stock_load_button.setEnabled(False)
+        self.stock_load_button.setText("加载中…")
+        pool_symbols = {
+            str(item) for item in current_pool.get("symbols") or [] if str(item)
+        }
+        in_current_pool = symbol in pool_symbols
+        score_record = (
+            self.store.latest_topdown_score(
+                symbol,
+                strategy_version=TOPDOWN_STRATEGY_ID,
+                scoring_version=TOPDOWN_SCORING_VERSION,
+                pool_version=(current_pool_version if in_current_pool else ""),
+            )
+            if self.store.available
+            else None
+        )
         score = (score_record or {}).get("snapshot") or {}
         hotspot_record = self.store.latest_hotspot_snapshot(symbol) if self.store.available else None
         hotspot = (hotspot_record or {}).get("snapshot") or {}
         plans = self.store.list_plans(symbol=symbol) if self.store.available else []
         self.stock_detail_texts["quant"].setPlainText(json.dumps({
             "股票": symbol,
+            "股票池身份": (
+                f"当前基础池成员（{current_pool_version}）"
+                if in_current_pool
+                else "池外A股；需要独立确定性评估和用户单次批准"
+            ),
             "最新冻结四层评分": score or "数据不完整，禁止授权",
             "说明": "盘中评分只使用已收盘15分钟快照；AI不参与分数。",
         }, ensure_ascii=False, indent=2))
@@ -2277,10 +3543,31 @@ class TradeLedgerWindow(QWidget):
             self._stock_profile_thread.quit()
             self._stock_profile_thread.wait(1000)
         thread = QThread(self)
-        worker = _StockProfileWorker(symbol)
+        scanner = getattr(self.ctx, "daily_candidate_scanner", None)
+        can_assess_outside = bool(
+            not in_current_pool
+            and scanner is not None
+            and current_pool_version
+            and universe_record.get("data_complete")
+            and current_pool.get("data_complete", True)
+        )
+        if can_assess_outside:
+            worker = _ManualStockAssessmentWorker(symbol, scanner, current_pool)
+            worker.finished.connect(self._apply_manual_stock_assessment)
+            self.stock_load_button.setText("正在确定性评估…")
+        else:
+            worker = _StockProfileWorker(symbol)
+            worker.finished.connect(self._apply_stock_profile)
+            if not in_current_pool:
+                self.stock_detail_texts["quant"].setPlainText(json.dumps({
+                    "股票": symbol,
+                    "股票池身份": "池外A股",
+                    "评估状态": "基础股票池缺失或不完整，无法取得可信市场宽度",
+                    "交易状态": "DATA_INCOMPLETE；禁止生成计划或授权",
+                    "基础池版本": current_pool_version or "尚未生成",
+                }, ensure_ascii=False, indent=2))
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(self._apply_stock_profile)
         worker.failed.connect(self._show_stock_profile_error)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
@@ -2289,6 +3576,55 @@ class TradeLedgerWindow(QWidget):
         self._stock_profile_thread = thread
         self._stock_profile_worker = worker
         thread.start()
+
+    def _apply_manual_stock_assessment(
+        self,
+        symbol: str,
+        profile: object,
+        evaluation: object,
+        profile_error: str,
+    ) -> None:
+        decision = getattr(evaluation, "decision", None)
+        base_scan = getattr(evaluation, "base_scan", None)
+        if decision is None or base_scan is None:
+            self._show_stock_profile_error(symbol, "池外评估结果结构不完整")
+            return
+        for base_decision in base_scan.decisions:
+            self.store.add_quant_signal(base_decision)
+        self.store.add_quant_signal(decision)
+        allowed = str(decision.status.value) == "allow"
+        assessment = {
+            "股票": symbol,
+            "股票池身份": "池外A股（基础股票池未修改）",
+            "策略": MANUAL_EXCEPTION_STRATEGY_ID,
+            "基础池版本": evaluation.base_pool_version,
+            "基础池市场宽度": base_scan.market_breadth_pct,
+            "日线预选": "通过" if allowed else "未通过",
+            "确定性原因": decision.reasons or ["全部日线条件通过"],
+            "触发价": decision.trigger_price,
+            "最高允许价": decision.max_entry_price,
+            "初始止损": decision.initial_stop,
+            "有效期": decision.valid_until,
+            "后续状态": (
+                "已进入热点监控；等待连续两根已收盘15分钟评分后生成待批准计划"
+                if allowed
+                else "不会进入15分钟评分，不会生成交易计划"
+            ),
+            "风险约束": "正常单笔风险的一半；最多同时1只；禁止加仓、补仓和追价",
+            "授权边界": "查询不会直接授权；计划形成后仍需用户批准和完整组合风控",
+        }
+        self.stock_detail_texts["quant"].setPlainText(
+            json.dumps(assessment, ensure_ascii=False, indent=2, default=str)
+        )
+        if profile_error:
+            self._show_stock_profile_error(symbol, profile_error)
+        else:
+            self._apply_stock_profile(symbol, profile)
+        runtime = self._quant_runtime
+        if runtime is not None:
+            QTimer.singleShot(0, runtime.refresh_hotspots)
+            QTimer.singleShot(0, runtime.refresh_topdown_scores)
+        self.refresh()
 
     def _apply_stock_profile(self, symbol: str, profile: object) -> None:
         data = profile if isinstance(profile, dict) else {}
@@ -2325,14 +3661,48 @@ class TradeLedgerWindow(QWidget):
         self.stock_detail_texts["risk"].setPlainText(
             json.dumps(risk, ensure_ascii=False, indent=2, default=str)
         )
+        self.stock_load_button.setEnabled(True)
+        self.stock_load_button.setText("重新查询并评估")
 
     def _show_stock_profile_error(self, symbol: str, error: str) -> None:
+        friendly_error = _friendly_runtime_detail("stock_profile", error)
         message = (
-            f"{symbol} 公司资料加载失败：{error}\n"
-            "量化评分和交易授权不使用未加载的公司资料；请检查数据源后重试。"
+            f"{symbol} 公司资料暂时未能加载：{friendly_error}\n"
+            "量化评分和交易授权不使用未加载的公司资料；可稍后点击“重新查询并评估”。"
         )
         for key in ("company", "finance", "risk"):
             self.stock_detail_texts[key].setPlainText(message)
+        self.stock_load_button.setEnabled(True)
+        self.stock_load_button.setText("重新查询并评估")
+
+    def _show_stock_query_error(self, query: str, error: str) -> None:
+        """Show identity-resolution failures without leaving stale stock data."""
+        friendly_error = _friendly_runtime_detail("stock_query", error)
+        self.stock_detail_texts["quant"].setPlainText(json.dumps({
+            "查询内容": query,
+            "识别状态": "未找到唯一的A股股票",
+            "原因": friendly_error,
+            "交易状态": "BLOCKED；未读取行情、未评分、未生成交易计划",
+            "下一步": "请输入明确的6位A股代码，或从当前交易股票池中选择股票。",
+        }, ensure_ascii=False, indent=2))
+        self.stock_detail_texts["hotspot"].setPlainText(json.dumps({
+            "状态": "未开始热点检查",
+            "原因": "尚未确认唯一的A股证券身份",
+        }, ensure_ascii=False, indent=2))
+        self.stock_detail_texts["plan"].setPlainText(json.dumps({
+            "状态": "未生成交易计划",
+            "原因": "股票查询未通过",
+        }, ensure_ascii=False, indent=2))
+        message = (
+            f"未能确认「{query}」对应的A股股票：{friendly_error}\n"
+            "系统没有读取其他市场行情，也没有生成评分或交易计划。"
+        )
+        for key in ("company", "finance", "risk"):
+            self.stock_detail_texts[key].setPlainText(message)
+        self.stock_load_button.setEnabled(True)
+        self.stock_load_button.setText("重新查询并评估")
+        self.stock_symbol.setFocus()
+        self.stock_symbol.selectAll()
 
     def _refresh_hotspots(self) -> None:
         if self._quant_runtime is not None:
@@ -2343,10 +3713,30 @@ class TradeLedgerWindow(QWidget):
             return
         if self._hotspot_thread is not None and self._hotspot_thread.isRunning():
             return
-        symbols = {
+        universes = self.store.list_universe_snapshots(limit=1)
+        if not universes or not universes[0].get("data_complete"):
+            self.statusBar().showMessage(
+                "股票池数据不完整，热点与重大公告监控未启动；禁止新增交易",
+                8000,
+            )
+            return
+        pool = universes[0].get("snapshot") or {}
+        pool_symbols = {
+            str(symbol)
+            for symbol in pool.get("symbols") or []
+            if str(symbol).strip()
+        }
+        if not pool_symbols:
+            self.statusBar().showMessage(
+                "股票池没有有效成员，热点与重大公告监控未启动；禁止新增交易",
+                8000,
+            )
+            return
+        symbols = set(pool_symbols)
+        symbols.update({
             item["symbol"] for item in self.store.list_plans(lifecycle_open=True)
             if item.get("symbol")
-        }
+        })
         symbols.update(
             item["symbol"] for item in self.store.list_quant_signals(limit=1000)
             if item.get("status") == "allow" and item.get("symbol")
@@ -2355,11 +3745,23 @@ class TradeLedgerWindow(QWidget):
             symbols.update(item.symbol for item in self._broker_snapshot.positions)
         if not symbols:
             return
+        registry = getattr(self.ctx, "validation_epochs", None)
+        epoch = registry.require_current() if registry is not None else None
+        batch_epoch_id = epoch.epoch_id if epoch is not None else ""
+        batch_pool_version = str(pool.get("version") or "")
         thread = QThread(self)
         worker = _HotspotBatchWorker(service, sorted(symbols))
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.snapshot_ready.connect(self._store_hotspot_snapshot)
+        worker.snapshot_ready.connect(
+            lambda snapshot,
+            epoch_id=batch_epoch_id,
+            pool_version=batch_pool_version: self._store_hotspot_snapshot(
+                snapshot,
+                expected_epoch_id=epoch_id,
+                expected_pool_version=pool_version,
+            )
+        )
         worker.failed.connect(self._hotspot_failed)
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -2379,17 +3781,13 @@ class TradeLedgerWindow(QWidget):
         if self._topdown_thread is not None and self._topdown_thread.isRunning():
             return
         now = datetime.now().astimezone()
-        if now.weekday() >= 5 or not (
-            (9, 30) <= (now.hour, now.minute) <= (11, 30)
-            or (13, 0) <= (now.hour, now.minute) <= (15, 0)
-        ):
+        from pa_agent.trading.topdown_market_data import expected_topdown_bar_close
+
+        expected_close = expected_topdown_bar_close(now)
+        if expected_close is None:
             return
-        slot = now.replace(
-            minute=now.minute - now.minute % 15, second=0, microsecond=0
-        ).isoformat()
+        slot = expected_close.isoformat()
         if slot == self._last_topdown_slot:
-            return
-        if now.minute % 15 > 4:
             return
         universes = self.store.list_universe_snapshots(limit=1)
         if not universes or not universes[0].get("data_complete"):
@@ -2405,18 +3803,8 @@ class TradeLedgerWindow(QWidget):
             return
         if self._sentiment_thread is not None and self._sentiment_thread.isRunning():
             return
-        signals = self.store.list_quant_signals(limit=1000)
-        breadth = next((
-            float((item.get("decision") or {}).get("condition_snapshot", {}).get(
-                "market_breadth_pct"
-            ))
-            for item in signals
-            if (item.get("decision") or {}).get("condition_snapshot", {}).get(
-                "market_breadth_pct"
-            ) is not None
-        ), None)
         thread = QThread(self)
-        worker = _MarketSentimentWorker(service, self.store, breadth, now)
+        worker = _MarketSentimentWorker(service, self.store, now)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(
@@ -2470,7 +3858,11 @@ class TradeLedgerWindow(QWidget):
                 if hotspot is not None and getattr(self.ctx, "hotspot_service", None)
                 else None
             )
-            previous_record = self.store.latest_topdown_score(symbol)
+            previous_record = self.store.latest_topdown_score(
+                symbol,
+                strategy_version=TOPDOWN_STRATEGY_ID,
+                scoring_version=TOPDOWN_SCORING_VERSION,
+            )
             previous = (
                 TopDownScoreSnapshot.model_validate(previous_record["snapshot"])
                 if previous_record else None
@@ -2534,41 +3926,42 @@ class TradeLedgerWindow(QWidget):
                 self.ctx.quant_workflow.create_topdown_plan(daily, score)
         if score.status.value != "authorization_revoked":
             return
-        for plan in self.store.list_plans(symbol=score.symbol):
-            if plan.get("status") not in {
-                "awaiting_user_confirmation", "submitted", "partially_filled",
-            }:
-                continue
-            self.store.update_plan(plan["id"], status="invalidated")
-            self.store.append_event(
-                plan["id"], "topdown_authorization_revoked",
-                details={
-                    "score": score.total_score,
-                    "hard_blocks": score.hard_blocks,
-                    "bar_closed_at": score.bar_closed_at,
-                },
-            )
+        from pa_agent.trading.authorization_risk import (
+            apply_topdown_authorization_revocation,
+        )
+
+        apply_topdown_authorization_revocation(
+            store=self.store,
+            score=score,
+            broker_adapter=getattr(self.ctx, "broker_adapter", None),
+        )
 
     def _topdown_failed(self, symbol: str, error: str) -> None:
         self.ctx.logger.warning("15分钟四层评分采集失败 %s: %s", symbol, error)
 
-    def _store_hotspot_snapshot(self, snapshot) -> None:
-        self.store.add_hotspot_snapshot(snapshot)
-        if not snapshot.negative_blocks:
-            return
-        for plan in self.store.list_plans(symbol=snapshot.symbol):
-            if plan.get("status") not in {"proposed", "triggered"}:
-                continue
-            self.store.update_plan(plan["id"], status="invalidated")
-            self.store.append_event(
-                plan["id"],
-                "major_negative_invalidated",
-                details={
-                    "negative_blocks": snapshot.negative_blocks,
-                    "hotspot_source_hash": snapshot.source_hash,
-                    "frozen_at": snapshot.frozen_at,
-                },
+    def _store_hotspot_snapshot(
+        self,
+        snapshot,
+        *,
+        expected_epoch_id: str = "",
+        expected_pool_version: str = "",
+    ) -> None:
+        ctx = getattr(self, "ctx", None)
+        registry = getattr(ctx, "validation_epochs", None)
+        if registry is not None:
+            snapshot = registry.bind_hotspot(
+                snapshot,
+                expected_epoch_id=expected_epoch_id,
+                expected_pool_version=expected_pool_version,
             )
+        self.store.add_hotspot_snapshot(snapshot)
+        from pa_agent.trading.hotspot_risk import apply_major_hotspot_risk
+
+        apply_major_hotspot_risk(
+            store=self.store,
+            snapshot=snapshot,
+            broker_adapter=getattr(ctx, "broker_adapter", None),
+        )
 
     def _hotspot_failed(self, symbol: str, error: str) -> None:
         self.ctx.logger.warning("热点刷新失败 %s: %s", symbol, error)
@@ -2624,7 +4017,9 @@ class TradeLedgerWindow(QWidget):
         self._reconciliation_order = None
         for thread in (
             self._stock_profile_thread,
+            self._universe_mutation_thread,
             self._oos_backtest_thread,
+            self._production_oos_thread,
         ):
             if thread is not None and thread.isRunning():
                 thread.requestInterruption()
@@ -2659,6 +4054,13 @@ class TradeLedgerWindow(QWidget):
             self.store.export_csv(Path(filename), dataset=dataset, **filters)
 
     def _save_risk(self) -> None:
+        if self.monthly_warning.value() >= self.monthly_stop.value():
+            QMessageBox.warning(
+                self,
+                "月度风控参数无效",
+                "月亏警戒必须小于月亏停止新增阈值。",
+            )
+            return
         risk = self.ctx.settings.risk
         risk.account_equity = self.equity.value() or None
         risk.available_cash = self.cash.value() or None
@@ -2669,6 +4071,15 @@ class TradeLedgerWindow(QWidget):
         )
         self.ctx.settings.portfolio_risk.initial_max_open_risk_pct = (
             self.initial_max_open.value()
+        )
+        self.ctx.settings.portfolio_risk.monthly_warning_loss_pct = (
+            self.monthly_warning.value()
+        )
+        self.ctx.settings.portfolio_risk.highest_grade_score = (
+            self.highest_grade.value()
+        )
+        self.ctx.settings.portfolio_risk.monthly_stop_loss_pct = (
+            self.monthly_stop.value()
         )
         risk.daily_loss_warning_pct = self.daily.value()
         risk.weekly_loss_warning_pct = self.weekly.value()
@@ -2701,15 +4112,26 @@ class TradeLedgerWindow(QWidget):
             self.store.upsert_profile(dialog.value())
             self.refresh()
 
-    @staticmethod
-    def _fill(table: QTableWidget, rows: list[list]) -> None:
+    def _fill(self, table: QTableWidget, rows: list[list]) -> None:
+        sorting_enabled = table.isSortingEnabled()
+        table.setSortingEnabled(False)
+        table.setUpdatesEnabled(False)
         table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             for col_index, value in enumerate(row):
                 item = QTableWidgetItem("" if value is None else str(value))
                 item.setData(Qt.ItemDataRole.UserRole, value)
+                item.setToolTip(item.text())
                 table.setItem(row_index, col_index, item)
         table.resizeColumnsToContents()
+        table.setUpdatesEnabled(True)
+        table.setSortingEnabled(sorting_enabled)
+        empty_label = self._table_empty_labels.get(table)
+        if empty_label is not None:
+            table.setVisible(bool(rows))
+            empty_label.setVisible(not rows)
+        if table is getattr(self, "universe", (None, None))[1]:
+            self._filter_universe_rows(self.universe_search.text())
 
 
 def _pct_spin(value: float, maximum: float = 100.0) -> QDoubleSpinBox:
@@ -2733,9 +4155,63 @@ def _strategy_label(value: str) -> str:
         return "4:3:2:1四层策略"
     if value in {"hs300_daily_pullback_v1", "cloud_ai_daily_pullback_v1"}:
         return "日线回调基线"
-    if value == "manual_exception_4321_v1":
+    if value == MANUAL_EXCEPTION_STRATEGY_ID:
         return "池外例外（半风险）"
     return "AI研究/遗留"
+
+
+def _friendly_runtime_detail(task: str, detail: str) -> str:
+    """Keep the header actionable while retaining raw diagnostics in its tooltip."""
+    normalized = detail.casefold()
+    if "could not resolve host" in normalized or "curl: (6)" in normalized:
+        subject = {
+            "hotspots": "热点数据源",
+            "sentiment": "市场情绪数据源",
+            "universe": "股票池数据源",
+            "daily_candidates": "日线行情数据源",
+            "topdown": "评分数据源",
+            "market_history": "历史行情数据源",
+        }.get(task, "外部数据源")
+        return f"{subject}暂时无法连接；已保留上次可信数据，本次新增交易保持阻断"
+    if "timed out" in normalized or "timeout" in normalized:
+        return "外部数据源响应超时；系统稍后重试，本次新增交易保持阻断"
+    return detail
+
+
+def _topdown_status_label(value: str) -> str:
+    return {
+        "data_incomplete": "数据不完整",
+        "blocked": "已阻断",
+        "observe": "继续观察",
+        "wait_confirmation": "等待下一根确认",
+        "eligible_for_risk": "可进入组合风控",
+        "authorization_revoked": "授权已撤销",
+    }.get(value, value or "状态未知")
+
+
+def _broker_connection_label(
+    state,
+    *,
+    binding_confirmed: bool,
+    snapshot_complete: bool,
+) -> str:
+    if state is None:
+        return "尚未检测"
+    if not state.usable:
+        return {
+            "disconnected": "客户端未运行",
+            "login_required": "等待用户登录",
+            "account_mismatch": "账户不匹配",
+            "adapter_incompatible": "客户端需重新校准",
+            "blocked_by_modal": "被弹窗阻断",
+            "stale": "数据已过期",
+            "error": "连接异常",
+        }.get(str(state.status.value), "未就绪")
+    if not binding_confirmed:
+        return "客户端已连接 · 账户待确认"
+    if not snapshot_complete:
+        return "账户已绑定 · 事实表未完整"
+    return "账户已绑定 · 只读同步正常"
 
 
 def _money(value) -> str:

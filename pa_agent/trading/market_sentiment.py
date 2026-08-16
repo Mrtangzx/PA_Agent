@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -13,7 +14,10 @@ from pa_agent.trading.topdown import SentimentScoreInput
 
 
 class MarketSentimentSnapshot(BaseModel):
+    # ``captured_at`` is the 15-minute scoring slot. ``observed_at`` is when
+    # every network/local input was actually available to the strategy.
     captured_at: str
+    observed_at: str = ""
     source_as_of: str = ""
     input: SentimentScoreInput | None = None
     data_complete: bool = True
@@ -42,6 +46,12 @@ class MarketSentimentService:
         *,
         universe_loader: Callable[..., list[dict[str, Any]]] | None = None,
         limit_pool_loader: Callable[..., dict[str, Any]] | None = None,
+        hs300_breadth_loader: (
+            Callable[[datetime], tuple[float | None, dict[str, Any]]] | None
+        ) = None,
+        hs300_member_loader: Callable[[], Any] | None = None,
+        hs300_spot_loader: Callable[[list[str]], list[dict[str, Any]]] | None = None,
+        now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         if universe_loader is None or limit_pool_loader is None:
             from pa_agent.data.eastmoney_client import iter_stock_universe
@@ -50,6 +60,15 @@ class MarketSentimentService:
             limit_pool_loader = limit_pool_loader or fetch_limit_pool_snapshot
         self.universe_loader = universe_loader
         self.limit_pool_loader = limit_pool_loader
+        self.hs300_breadth_loader = hs300_breadth_loader
+        self.hs300_member_loader = hs300_member_loader or _load_official_hs300
+        if hs300_spot_loader is None:
+            from pa_agent.data.eastmoney_client import fetch_stock_spot_rows
+
+            hs300_spot_loader = fetch_stock_spot_rows
+        self.hs300_spot_loader = hs300_spot_loader
+        self.now_provider = now_provider or (lambda: datetime.now().astimezone())
+        self._hs300_member_cache: tuple[float, Any] | None = None
 
     def capture(
         self,
@@ -62,8 +81,10 @@ class MarketSentimentService:
         previous_inputs: list[SentimentScoreInput] | None = None,
         broad_index_positive: bool | None = None,
         market_rows: list[dict[str, Any]] | None = None,
+        observed_at: datetime | None = None,
     ) -> MarketSentimentSnapshot:
         now = (captured_at or datetime.now().astimezone()).astimezone()
+        observed = (observed_at or now).astimezone()
         gaps: list[str] = []
         rows = market_rows if market_rows is not None else self.universe_loader()
         valid = [item for item in rows if item.get("pct_chg") is not None]
@@ -95,6 +116,7 @@ class MarketSentimentService:
         if gaps:
             return MarketSentimentSnapshot(
                 captured_at=now.isoformat(),
+                observed_at=observed.isoformat(),
                 source_as_of=str(pool.get("source_as_of") or ""),
                 data_complete=False,
                 data_gaps=gaps,
@@ -142,6 +164,7 @@ class MarketSentimentService:
         )
         return MarketSentimentSnapshot(
             captured_at=now.isoformat(),
+            observed_at=observed.isoformat(),
             source_as_of=str(pool["source_as_of"]),
             input=SentimentScoreInput(
                 advancing_pct=advancing_pct,
@@ -170,18 +193,25 @@ class MarketSentimentService:
         self,
         *,
         store: Any,
-        hs300_breadth_pct: float | None,
         captured_at: datetime | None = None,
     ) -> MarketSentimentSnapshot:
         """Capture all structured inputs once and persist the daily price baseline."""
         now = (captured_at or datetime.now().astimezone()).astimezone()
         rows = self.universe_loader()
+        if self.hs300_breadth_loader is not None:
+            hs300_breadth_pct, breadth_details = self.hs300_breadth_loader(now)
+        else:
+            hs300_breadth_pct, breadth_details = self._hs300_breadth_from_store(
+                store=store, market_rows=rows, captured_at=now
+            )
         new_high, new_low, price_details = store.update_market_daily_prices_and_high_low(
             rows,
             as_of=now.date().isoformat(),
             captured_at=now.isoformat(),
         )
         turnover, turnover_details = self.turnover_vs_ma20(captured_at=now)
+        observed_at = self.now_provider().astimezone()
+        capture_delay = max(0.0, (observed_at - now).total_seconds())
         previous_inputs = []
         for record in store.list_market_sentiment_snapshots(limit=8):
             payload = (record.get("snapshot") or {}).get("input")
@@ -196,14 +226,104 @@ class MarketSentimentService:
             previous_inputs=previous_inputs,
             broad_index_positive=turnover_details.get("broad_index_positive"),
             market_rows=rows,
+            observed_at=observed_at,
         )
+        if capture_delay > 300:
+            snapshot = snapshot.model_copy(update={
+                "input": None,
+                "data_complete": False,
+                "data_gaps": list(dict.fromkeys([
+                    *snapshot.data_gaps, "sentiment_capture_delay_exceeded_300s",
+                ])),
+            })
         return snapshot.model_copy(update={
             "source_details": {
                 **snapshot.source_details,
                 "market_price_history": price_details,
                 "turnover_history": turnover_details,
+                "hs300_breadth": breadth_details,
+                "scoring_slot": now.isoformat(),
+                "observed_at": observed_at.isoformat(),
+                "capture_delay_seconds": round(capture_delay, 6),
             }
         }).with_source_hash()
+
+    def _hs300_breadth_from_store(
+        self,
+        *,
+        store: Any,
+        market_rows: list[dict[str, Any]],
+        captured_at: datetime,
+    ) -> tuple[float | None, dict[str, Any]]:
+        """Calculate live breadth from one spot snapshot and 19 closed sessions."""
+        official = self._official_hs300()
+        members = [item.symbol for item in official.constituents]
+        details: dict[str, Any] = {
+            "source": "CSI official members + local verified closes + East Money spot",
+            "source_as_of": official.source_as_of.isoformat(),
+            "source_hash": official.source_hash,
+            "captured_at": captured_at.isoformat(),
+            "member_count": len(members),
+            "history_sessions_required": 19,
+        }
+        if len(members) != 300 or len(set(members)) != 300:
+            details["reason"] = f"official_member_count_{len(members)}_expected_300"
+            return None, details
+        spot = {
+            str(item.get("code") or ""): float(item["price"])
+            for item in market_rows
+            if str(item.get("code") or "") in set(members)
+            and item.get("price") is not None
+            and float(item["price"]) > 0
+        }
+        missing_spot = [symbol for symbol in members if symbol not in spot]
+        if missing_spot:
+            for item in self.hs300_spot_loader(missing_spot):
+                symbol = str(item.get("code") or "")
+                price = item.get("price")
+                if symbol in set(missing_spot) and price is not None and float(price) > 0:
+                    spot[symbol] = float(price)
+        details["spot_fallback_requested"] = len(missing_spot)
+        details["spot_fallback_resolved"] = sum(
+            symbol in spot for symbol in missing_spot
+        )
+        history = store.market_daily_history_for_symbols(
+            set(members), before_as_of=captured_at.date().isoformat(), limit_sessions=19
+        )
+        above = 0
+        valid = 0
+        failures: list[str] = []
+        for symbol in members:
+            closes = history.get(symbol, [])
+            current = spot.get(symbol)
+            if current is None or len(closes) != 19:
+                failures.append(
+                    f"{symbol}:spot_{'ok' if current is not None else 'missing'}:"
+                    f"history_{len(closes)}"
+                )
+                continue
+            ma20 = (sum(closes) + current) / 20
+            valid += 1
+            above += int(current > ma20)
+        details.update({
+            "valid_member_count": valid,
+            "above_ma20_count": above,
+            "failed_member_count": len(failures),
+            "failure_examples": failures[:10],
+        })
+        if valid != 300:
+            details["reason"] = f"hs300_spot_and_history_complete_{valid}_of_300"
+            return None, details
+        return above / valid * 100, details
+
+    def _official_hs300(self) -> Any:
+        cached = self._hs300_member_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < 6 * 60 * 60:
+            return cached[1]
+        official = self.hs300_member_loader()
+        self._hs300_member_cache = (now, official)
+        return official
 
     @staticmethod
     def turnover_vs_ma20(
@@ -223,7 +343,11 @@ class MarketSentimentService:
                 latest_direction[code] = float(rows[-1]["close"]) >= float(rows[-2]["close"])
             for row in rows:
                 value = row.get("time")
-                day = value.date() if isinstance(value, datetime) else date.fromisoformat(str(value)[:10])
+                day = (
+                    value.date()
+                    if isinstance(value, datetime)
+                    else date.fromisoformat(str(value)[:10])
+                )
                 series[day] = series.get(day, 0.0) + float(row.get("amount") or 0)
         ordered = sorted(series.items())
         if len(ordered) < 21:
@@ -279,3 +403,8 @@ def fetch_limit_pool_snapshot(*, date: str) -> dict[str, Any]:
             source_as_of = max(source_as_of, qdate)
     result["source_as_of"] = source_as_of
     return result
+
+
+def _load_official_hs300() -> Any:
+    from pa_agent.trading.universe import load_official_current_hs300
+    return load_official_current_hs300()

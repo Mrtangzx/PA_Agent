@@ -16,6 +16,23 @@ _CN_TZ = ZoneInfo("Asia/Shanghai")
 
 _STOCK_CODE_RE = re.compile(r"^\d{6}$")
 _INDEX_PREFIX_RE = re.compile(r"^(sh|sz)(\d{6})$", re.IGNORECASE)
+_A_SHARE_STOCK_PREFIXES = (
+    "000", "001", "002", "003",  # Shenzhen main board
+    "300", "301",                  # ChiNext
+    "600", "601", "603", "605",  # Shanghai main board
+    "688", "689",                  # STAR Market
+)
+_BSE_STOCK_PREFIXES = ("43", "83", "87", "88", "92")
+_EXPLICIT_INDEX_SYMBOLS = {
+    "SH000001",
+    "SH000016",
+    "SH000300",
+    "SH000852",
+    "SH000905",
+    "SZ399001",
+    "SZ399006",
+    "SZ399300",
+}
 
 PRESET_SYMBOLS: tuple[str, ...] = (
     "000001",
@@ -56,12 +73,38 @@ def _is_index_digits(digits: str) -> bool:
 
 def is_index_symbol(symbol: str) -> bool:
     """True for sh/sz-prefixed index codes or common CSI/ChiNext codes."""
+    raw = (symbol or "").strip().upper().replace(" ", "")
+    if raw.endswith((".SH", ".SZ")):
+        code, exchange = raw.rsplit(".", 1)
+        raw = f"{exchange}{code}"
+    if raw in _EXPLICIT_INDEX_SYMBOLS:
+        return True
     sym = normalize_ashare_symbol(symbol)
     if sym.startswith(("sh", "sz")) and len(sym) >= 8:
         return True
     if _STOCK_CODE_RE.match(sym):
         return _is_index_digits(sym)
     return False
+
+
+def is_a_share_stock_symbol(symbol: str) -> bool:
+    """Return whether *symbol* is an investable mainland A-share stock code.
+
+    The production investment scope intentionally excludes indices, funds,
+    bonds, B shares, futures, forex, crypto, Hong Kong and overseas symbols.
+    Beijing Stock Exchange numeric codes are A shares too; individual members
+    can still be marked analysis-only by the active universe definition.
+    """
+    raw = (symbol or "").strip().upper().replace(" ", "")
+    if raw.startswith(("SH", "SZ", "BJ")):
+        raw = raw[2:]
+    if raw.endswith((".SH", ".SZ", ".BJ")):
+        raw = raw[:-3]
+    if not _STOCK_CODE_RE.fullmatch(raw) or is_index_symbol(symbol):
+        return False
+    if raw.startswith(_A_SHARE_STOCK_PREFIXES):
+        return True
+    return raw.startswith(_BSE_STOCK_PREFIXES)
 
 
 def index_symbol_for_api(symbol: str) -> str:

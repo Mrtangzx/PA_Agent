@@ -73,6 +73,16 @@ _REPORT_NAMES: dict[str, tuple[str, str, str]] = {
 
 _BOARD_TAG_FIELDS = "f127,f128,f129"
 
+
+def _optional_float(value: Any) -> float | None:
+    """Parse an East Money numeric field without inventing missing dash values."""
+    if value is None or str(value).strip() in {"", "-", "--"}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 _EMWEB_PAGES = frozenset(
     {
         "CompanySurvey",
@@ -126,16 +136,20 @@ def _symbol_code(symbol: str) -> str:
 
 def _em_code(symbol: str) -> str:
     code = _symbol_code(symbol)
-    if code.startswith(("5", "6", "9")):
+    if code.startswith(("600", "601", "603", "605", "688", "689")):
         return f"SH{code}"
-    return f"SZ{code}"
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return f"SZ{code}"
+    return f"BJ{code}"
 
 
 def _secucode(symbol: str) -> str:
     code = _symbol_code(symbol)
-    if code.startswith(("5", "6", "9")):
+    if code.startswith(("600", "601", "603", "605", "688", "689")):
         return f"{code}.SH"
-    return f"{code}.SZ"
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return f"{code}.SZ"
+    return f"{code}.BJ"
 
 
 def _parse_fflow_klines(
@@ -444,15 +458,27 @@ def fetch_board_constituent_snapshot(board_code: str) -> dict[str, Any] | None:
             rows.extend(page_rows)
             if not page_rows or len(rows) >= total:
                 break
-        valid = [item for item in rows if item.get("f3") not in (None, "-")]
+        valid = [item for item in rows if _optional_float(item.get("f3")) is not None]
         if not valid:
             return None
+        turnovers = [_optional_float(item.get("f6")) for item in valid]
         return {
             "constituent_count": total or len(valid),
             "sampled_count": len(valid),
             "breadth_sample_complete": (total or len(valid)) <= len(valid),
-            "advancing_pct": sum(float(item["f3"]) > 0 for item in valid) / len(valid) * 100,
-            "turnover": sum(float(item.get("f6") or 0) for item in valid),
+            "advancing_pct": (
+                sum((_optional_float(item.get("f3")) or 0) > 0 for item in valid)
+                / len(valid)
+                * 100
+            ),
+            # A dash means East Money did not publish the value.  Preserve that
+            # fact instead of treating it as zero or failing the whole hotspot.
+            "turnover": (
+                sum(value for value in turnovers if value is not None)
+                if all(value is not None for value in turnovers)
+                else None
+            ),
+            "turnover_complete": all(value is not None for value in turnovers),
         }
     except EastMoneyTransientError as exc:
         logger.debug("board constituent snapshot failed %s: %s", board_code, exc)

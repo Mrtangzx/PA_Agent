@@ -16,7 +16,9 @@ from pa_agent.trading.stability import (
     StateTransition,
     StrategyStabilityController,
 )
-from pa_agent.trading.topdown import TOPDOWN_STRATEGY_ID
+from pa_agent.trading.topdown import TOPDOWN_SCORING_VERSION, TOPDOWN_STRATEGY_ID
+from pa_agent.trading.universe import CLOUD_AI_UNIVERSE_ID
+from pa_agent.trading.validation_epoch import ValidationEpoch, ValidationEpochRegistry
 
 
 class PromotionEvidenceReport(BaseModel):
@@ -28,20 +30,70 @@ class PromotionEvidenceReport(BaseModel):
     promotion_eligible: bool = False
     data_gaps: list[str] = Field(default_factory=list)
     generated_at: str
+    validation_epoch_id: str = ""
+    pool_version: str = ""
+    member_hash: str = ""
 
 
 def build_shadow_performance_evidence(
     store: Any,
     *,
     strategy_id: str = TOPDOWN_STRATEGY_ID,
+    as_of: datetime | None = None,
+    validation_epochs: ValidationEpochRegistry | None = None,
 ) -> tuple[PerformanceEvidence, list[str]]:
     """Derive shadow evidence exclusively from persisted, auditable results."""
-    rows = [
+    all_rows = [
         item
         for item in store.list_results(dataset="shadow")
         if item.get("strategy_version") == strategy_id
     ]
     gaps: list[str] = []
+    registry = validation_epochs or ValidationEpochRegistry(store)
+    epoch = registry.require_current()
+    shadow_started_at = _trusted_shadow_started_at(
+        store, strategy_id=strategy_id, epoch=epoch
+    )
+    if shadow_started_at is None:
+        gaps.append("shadow_state_not_entered")
+    current_state = str(store.current_strategy_state(strategy_id))
+    if current_state != StrategyState.SHADOW.value:
+        gaps.append(f"shadow_state_not_current:{current_state}")
+
+    observation_end = (as_of or datetime.now().astimezone()).astimezone()
+    if shadow_started_at is not None and observation_end < shadow_started_at:
+        gaps.append("shadow_observation_clock_before_state_entry")
+        observation_end = shadow_started_at
+
+    rows: list[dict[str, Any]] = []
+    pre_shadow_count = 0
+    timestamp_incomplete = False
+    for item in all_rows:
+        opened_at = _parse_time(item.get("opened_at"))
+        closed_at = _parse_time(item.get("closed_at"))
+        if opened_at is None or closed_at is None:
+            timestamp_incomplete = True
+            continue
+        if shadow_started_at is None:
+            pre_shadow_count += 1
+            continue
+        if opened_at < shadow_started_at or closed_at < shadow_started_at:
+            pre_shadow_count += 1
+            continue
+        if opened_at > observation_end or closed_at > observation_end:
+            timestamp_incomplete = True
+            continue
+        if epoch.is_private_pool:
+            plan = store.get_plan(str(item.get("plan_id") or "")) or {}
+            score = (plan.get("risk_snapshot") or {}).get("topdown_score") or {}
+            if str(score.get("pool_version") or "") not in epoch.pool_versions:
+                pre_shadow_count += 1
+                continue
+        rows.append(item)
+    if pre_shadow_count:
+        gaps.append(f"pre_shadow_results_excluded:{pre_shadow_count}")
+    if timestamp_incomplete:
+        gaps.append("shadow_trade_timestamps_incomplete")
     if not rows:
         gaps.append("shadow_trade_results_missing")
     opened = [_parse_time(item.get("opened_at")) for item in rows]
@@ -50,8 +102,7 @@ def build_shadow_performance_evidence(
     valid_closed = [item for item in closed if item is not None]
     if len(valid_opened) != len(rows) or len(valid_closed) != len(rows):
         gaps.append("shadow_trade_timestamps_incomplete")
-    observation_start = min(valid_opened) if valid_opened else None
-    observation_end = max(valid_closed) if valid_closed else None
+    observation_start = shadow_started_at
     weeks = (
         max(0.0, (observation_end - observation_start).total_seconds() / 604800)
         if observation_start and observation_end
@@ -87,12 +138,23 @@ def build_shadow_performance_evidence(
     )
 
     plan_sources_complete = bool(rows)
+    frozen_at = _parse_time(epoch.activated_at)
     for item in rows:
         plan = store.get_plan(str(item.get("plan_id") or "")) or {}
         score = (plan.get("risk_snapshot") or {}).get("topdown_score") or {}
+        score_time = _parse_time(score.get("bar_closed_at"))
         if not (
-            score.get("input_hash")
-            and score.get("bar_closed_at")
+            score.get("strategy_version") == strategy_id
+            and score.get("scoring_version") == TOPDOWN_SCORING_VERSION
+            and (
+                str(score.get("pool_version") or "") in epoch.pool_versions
+                if epoch.is_private_pool
+                else str(score.get("pool_version") or "").startswith(CLOUD_AI_UNIVERSE_ID)
+            )
+            and score.get("input_hash")
+            and score_time is not None
+            and frozen_at is not None
+            and score_time >= frozen_at
             and not score.get("data_gaps")
             and not score.get("hard_blocks")
         ):
@@ -100,6 +162,7 @@ def build_shadow_performance_evidence(
             break
     if rows and not plan_sources_complete:
         gaps.append("shadow_topdown_source_trace_incomplete")
+        gaps.append("shadow_topdown_version_trace_incomplete")
 
     fixed_runs = [
         item
@@ -140,17 +203,53 @@ def build_shadow_performance_evidence(
     return evidence, list(dict.fromkeys(gaps))
 
 
+def _trusted_shadow_started_at(
+    store: Any, *, strategy_id: str, epoch: ValidationEpoch
+) -> datetime | None:
+    """Find the latest auditable entry into a fresh formal shadow period."""
+    for event in store.list_strategy_transitions(strategy_id=strategy_id, limit=1000):
+        if str(event.get("current_state")) != StrategyState.SHADOW.value:
+            continue
+        previous = str(event.get("previous_state"))
+        if previous not in {StrategyState.CANDIDATE.value, StrategyState.PAUSED.value}:
+            continue
+        run_id = str(event.get("validation_run_id") or "")
+        validation = store.get_validation_run(run_id)
+        if not (
+            validation
+            and validation.get("status") == "complete"
+            and validation.get("promotion_eligible")
+            and validation.get("strategy_version") == strategy_id
+        ):
+            continue
+        report = validation.get("report") or {}
+        if epoch.is_private_pool and not _report_matches_epoch(report, epoch):
+            continue
+        if previous == StrategyState.CANDIDATE.value and validation.get("dataset") != "out_of_sample":
+            continue
+        created_at = _parse_time(event.get("created_at"))
+        if created_at is not None:
+            return created_at
+    return None
+
+
 class StrategyPromotionService:
-    def __init__(self, store: Any) -> None:
+    def __init__(
+        self, store: Any, *, validation_epochs: ValidationEpochRegistry | None = None
+    ) -> None:
         self.store = store
+        self.validation_epochs = validation_epochs or ValidationEpochRegistry(store)
         self.controller = StrategyStabilityController()
 
     def refresh_shadow_report(
         self, *, strategy_id: str = TOPDOWN_STRATEGY_ID
     ) -> PromotionEvidenceReport:
         evidence, gaps = build_shadow_performance_evidence(
-            self.store, strategy_id=strategy_id
+            self.store,
+            strategy_id=strategy_id,
+            validation_epochs=self.validation_epochs,
         )
+        epoch = self.validation_epochs.require_current()
         transition = self.controller.evaluate(StrategyState.SHADOW, evidence)
         eligible = transition.reasons == ["awaiting_explicit_live_activation_approval"]
         generated_at = datetime.now().astimezone().isoformat()
@@ -159,6 +258,9 @@ class StrategyPromotionService:
             "dataset": "shadow",
             "performance_evidence": evidence.model_dump(mode="json"),
             "data_gaps": gaps,
+            "validation_epoch_id": epoch.epoch_id,
+            "pool_version": epoch.pool_version,
+            "member_hash": epoch.member_hash,
         }
         report = PromotionEvidenceReport(
             strategy_version=strategy_id,
@@ -169,6 +271,9 @@ class StrategyPromotionService:
             promotion_eligible=eligible and not gaps,
             data_gaps=gaps,
             generated_at=generated_at,
+            validation_epoch_id=epoch.epoch_id,
+            pool_version=epoch.pool_version,
+            member_hash=epoch.member_hash,
         )
         self.store.add_validation_run(
             report,
@@ -196,6 +301,9 @@ class StrategyPromotionService:
         )
         if payload.get("strategy_version") != strategy_id:
             raise ValueError("OOS report strategy does not match promotion target")
+        epoch = self.validation_epochs.require_current()
+        if epoch.is_private_pool and not _report_matches_epoch(payload, epoch):
+            raise ValueError("OOS report validation epoch does not match current stock pool")
         from pa_agent.trading.oos_backtest import validate_oos_report_consistency
 
         evidence = validate_oos_report_consistency(report)
@@ -288,3 +396,11 @@ def _stable_hash(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _report_matches_epoch(report: dict[str, Any], epoch: ValidationEpoch) -> bool:
+    return (
+        str(report.get("validation_epoch_id") or "") == epoch.epoch_id
+        and str(report.get("member_hash") or "") == epoch.member_hash
+        and str(report.get("pool_version") or "") in epoch.pool_versions
+    )

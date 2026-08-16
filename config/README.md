@@ -12,12 +12,9 @@
    copy config\settings.example.json config\settings.json
    ```
 
-2. 启动程序，在 **设置** 中选择 AI 运行方式：
+2. 启动程序前先完成本机 Codex 登录。PA Agent 的两阶段分析、自由对话和重试调用统一使用 **Codex SDK**，无需 Base URL 或 API Key。
 
-   - 使用 OpenAI 兼容 API 时填写 **API Key**；
-   - 使用 **Codex SDK（本地 Agent）** 时先登录本机 Codex，无需 Base URL 或 API Key。
-
-   也可直接编辑 `config/settings.json` 中的 `base_url`、`model` 等字段，Key 仍建议通过 GUI 保存以便自动加密。
+   设置页只保留 Codex 模型信息；保存时会清除旧配置中的第三方 Base URL 和模型 API Key。
 
 3. `config/exception_state.json` 由程序在需要时自动创建，一般无需手动复制。结构可参考 `exception_state.example.json`。
 
@@ -29,28 +26,30 @@
 
 ## `settings.json` 字段说明
 
-配置分为四个顶层组：`provider`、`general`、`prompt`、`validation`。
+配置统一保存在 `settings.json`；量化选股阈值位于 `stock_selection`，不在代码中散落维护。
 
 ### provider — AI 提供商
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `provider.backend` | string | `"openai_compatible"` | AI 运行方式：`openai_compatible` / `cursor_sdk` / `codex_sdk`。Codex SDK 使用本机 Codex 登录状态，并以临时只读 Agent 线程执行分析 |
-| `provider.model` | string | `"deepseek-v4-flash"` | 模型名称（须与网关支持的名称一致） |
-| `provider.base_url` | string | `"https://api.deepseek.com"` | OpenAI 兼容 API 根地址。DeepSeek：`https://api.deepseek.com`；MiMo：`https://api.xiaomimimo.com/v1`（程序自动处理 `enable_thinking` 与 `reasoning_content` 回放） |
-| `provider.api_key` | string | `""` | API Key（明文，内存中临时使用；不持久化到文件） |
-| `provider.api_key_encrypted` | string | `""` | 加密后的 Key；留空表示未配置（通过 GUI 保存时自动加密写入） |
+| `provider.backend` | string | `"codex_sdk"` | 固定为 Codex SDK；旧提供商值在加载时自动迁移 |
+| `provider.model` | string | `"gpt-5.6-terra"` | Codex SDK 使用的模型；默认 Terra |
+| `provider.base_url` | string | `""` | 固定为空；Codex SDK 不使用第三方模型网关 |
+| `provider.api_key` | string | `""` | 固定为空；认证来自本机 Codex 登录状态 |
+| `provider.api_key_encrypted` | string | `""` | 固定为空；PA Agent 不保存模型凭据 |
 | `provider.thinking` | bool | `true` | 是否启用思考/推理类扩展参数（依模型与网关而定）。关闭可 3–5 倍提速但分析质量下降 |
 | `provider.reasoning_effort` | string | `"high"` | 推理深度：`low` / `medium` / `high` / `max` |
 | `provider.context_window` | int | `2000000` | 用于上下文占用提示的窗口大小（tokens） |
+| `provider.codex_process.hide_console_on_windows` | bool | `true` | Windows 下隐藏 Codex app-server 控制台窗口；设为 `false` 可用于子进程调试 |
 
 ### general — 通用设置
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `general.last_data_source` | string | `"mt5"` | K 线数据来源：`mt5` / `tradingview` / `eastmoney` / `eastmoney_futures`（GUI 下拉选项）；`akshare` / `yfinance`（仅代码支持） |
+| `general.investment_scope` | string | `"a_share_only"` | 生产分析与投资范围固定为A股股票；指数只作为四层评分输入，不作为直接投资标的 |
+| `general.last_data_source` | string | `"eastmoney"` | 生产K线数据源固定为东方财富A股；其他旧数据源仅保留历史兼容代码，不在生产界面开放 |
 | `general.last_tradingview_exchange` | string | `""` | TradingView 交易所。空字符串 =（自动）依次探测预设列表。如 `OANDA`、`SSE`、`HKEX` 等 |
-| `general.last_symbol` | string | `"XAUUSDm"` | 默认品种。MT5 需含后缀（如 `m`），TradingView 用标准名（如 `XAUUSD`） |
+| `general.last_symbol` | string | `"600519"` | 默认A股股票代码；非A股、指数、基金、债券等输入会被生产入口拒绝 |
 | `general.last_timeframe` | string | `"15m"` | 默认周期，如 `1m`、`5m`、`15m`、`1h`、`4h`、`1d` |
 | `general.analysis_bar_count` | int | `100` | 提交分析时使用的 K 线数量（2–5000） |
 | `general.refresh_interval_ms` | int | `1000` | 图表自动刷新间隔（毫秒） |
@@ -75,6 +74,34 @@
 | `prompt.experience_max_entries` | int | `3` | 经验库最大加载条目数（0–10） |
 | `prompt.experience_max_chars_per_entry` | int | `400` | 每条经验最大字符数（100–4000） |
 | `prompt.stage1_inject_pattern_briefs` | bool | `true` | 阶段一是否注入模式判定表和速查 brief（减少 missed tags） |
+
+### portfolio_risk — 组合风控
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `portfolio_risk.monthly_warning_loss_pct` | float | `1.0` | 当月收益达到 `-1%` 后，只允许最高等级四层信号继续进入组合风控 |
+| `portfolio_risk.highest_grade_score` | float | `80.0` | 月度亏损警戒后的最低综合分；仅适用于四层评分新增策略 |
+| `portfolio_risk.monthly_stop_loss_pct` | float | `1.5` | 当月收益达到 `-1.5%` 后停止全部新增仓位，只管理退出 |
+| `portfolio_risk.live_trading_enabled` | bool | `false` | 实盘总开关；回测和影子验证完成前保持关闭 |
+
+### stock_selection — A股智能选股
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `stock_selection.refresh_seconds` | `900` | 后台选股刷新周期；手工点击“重新扫描”可立即运行 |
+| `stock_selection.seed_per_channel` | `18` | 涨幅、成交额、低量比三个全A种子通道各自读取数量 |
+| `stock_selection.hotspot_scan_limit` | `24` | 每轮进一步核验题材、资金和公告的最大股票数 |
+| `stock_selection.hot_theme_min_percentile` | `75.0` | 近期热点题材的板块相对强度最低分位 |
+| `stock_selection.hot_theme_min_persistence_days` | `2` | 热点最少持续交易日 |
+| `stock_selection.main_force_min_net_inflow_pct` | `0.5` | 主力关注题材的板块主力净流入占比下限 |
+| `stock_selection.volume_suffocation_max_ratio` | `0.65` | 近5日均量/此前20日均量上限 |
+| `stock_selection.atr_contraction_max_ratio` | `0.8` | 近5日ATR/此前20日ATR上限 |
+| `stock_selection.range_contraction_max_ratio` | `0.8` | 近5日振幅/此前20日振幅上限 |
+| `stock_selection.trend_min_volume_ratio` | `1.2` | 趋势突破日相对20日均量的最低量比 |
+| `stock_selection.require_no_major_negative` | `true` | 必须通过重大负面公告硬过滤；缺失或无法核验时不入选 |
+
+智能选股只生成观察候选。加入监控池后仍进入独立股票沙箱；池外股票继续走
+`manual_exception_4321_v1`，选股结果不会直接生成订单或解除风控。
 
 ### validation — 校验与重试
 

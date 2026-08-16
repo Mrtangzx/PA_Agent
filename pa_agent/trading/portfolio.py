@@ -7,16 +7,18 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from pa_agent.data.ashare_common import is_a_share_stock_symbol
 from pa_agent.trading.broker_models import (
     AuthorizedOrder,
     BrokerSnapshot,
     PortfolioSnapshot,
 )
-from pa_agent.trading.models import InstrumentProfile, RiskSettings
+from pa_agent.trading.models import AssetClass, InstrumentProfile, RiskSettings
 from pa_agent.trading.quant import SignalDecision, SignalStatus, StrategyState
 from pa_agent.trading.risk import calculate_position_size
 from pa_agent.trading.topdown import (
     MANUAL_EXCEPTION_STRATEGY_ID,
+    TOPDOWN_SCORING_VERSION,
     TOPDOWN_STRATEGY_ID,
     TopDownScoreSnapshot,
 )
@@ -36,6 +38,7 @@ class PortfolioRiskSettings(BaseModel):
     max_position_value_pct: float = Field(default=10.0, gt=0, le=100)
     max_sector_open_risk_pct: float = Field(default=0.75, gt=0, le=100)
     monthly_warning_loss_pct: float = Field(default=1.0, gt=0)
+    highest_grade_score: float = Field(default=80.0, ge=70, le=100)
     monthly_stop_loss_pct: float = Field(default=1.5, gt=0)
     monthly_profit_protect_pct: float = Field(default=2.0, gt=0)
     monthly_peak_drawdown_reduce_pct: float = Field(default=0.8, gt=0)
@@ -84,13 +87,24 @@ class PortfolioRisk:
         trading_channel: TradingChannel = "normal_pool",
         outside_pool_approval_valid: bool = False,
         outside_pool_position_count: int = 0,
+        expected_security_name: str = "",
     ) -> RiskDecision:
         reasons: list[str] = []
         s = self.settings
+        if profile.asset_class is not AssetClass.A_SHARE:
+            reasons.append("a_share_only_scope")
+        if not is_a_share_stock_symbol(signal.symbol):
+            reasons.append("a_share_stock_symbol_required")
         if signal.status is not SignalStatus.ALLOW:
             reasons.append("quant_signal_not_allowed")
         if not portfolio.data_complete:
             reasons.extend(portfolio.data_gaps or ["portfolio_snapshot_incomplete"])
+        manual_exception = signal.strategy_id == MANUAL_EXCEPTION_STRATEGY_ID
+        outside_channel = trading_channel == "outside_pool_exception"
+        if manual_exception and not outside_channel:
+            reasons.append("manual_exception_channel_required")
+        if outside_channel and not manual_exception:
+            reasons.append("outside_pool_strategy_required")
         requires_topdown = signal.strategy_id in {
             TOPDOWN_STRATEGY_ID,
             MANUAL_EXCEPTION_STRATEGY_ID,
@@ -100,11 +114,17 @@ class PortfolioRisk:
                 reasons.append("topdown_score_required")
             elif topdown_score.symbol != signal.symbol:
                 reasons.append("topdown_score_symbol_mismatch")
+            elif topdown_score.pool_version != signal.pool_version:
+                reasons.append("topdown_score_pool_version_mismatch")
+            elif topdown_score.strategy_version != TOPDOWN_STRATEGY_ID:
+                reasons.append("topdown_score_strategy_version_mismatch")
+            elif topdown_score.scoring_version != TOPDOWN_SCORING_VERSION:
+                reasons.append("topdown_score_scoring_version_mismatch")
             elif not topdown_score.eligible_for_risk:
                 reasons.append(f"topdown_score_{topdown_score.status.value}")
             elif topdown_score.hard_blocks or topdown_score.data_gaps:
                 reasons.append("topdown_score_not_clean")
-        if trading_channel == "outside_pool_exception":
+        if manual_exception:
             if not outside_pool_approval_valid:
                 reasons.append("outside_pool_approval_required")
             if outside_pool_position_count >= 1:
@@ -117,6 +137,13 @@ class PortfolioRisk:
             reasons.append(f"broker_{broker.connection.status.value}")
         if s.require_complete_broker_snapshot and not broker.complete:
             reasons.append("broker_snapshot_incomplete")
+        if s.require_complete_broker_snapshot:
+            if not broker.positions_complete:
+                reasons.append("broker_positions_not_verified")
+            if not broker.orders_complete:
+                reasons.append("broker_orders_not_verified")
+            if not broker.fills_complete:
+                reasons.append("broker_fills_not_verified")
         if broker.account_fingerprint != broker.connection.account_fingerprint:
             reasons.append("broker_account_fingerprint_mismatch")
         if broker.available_cash is None or broker.total_equity is None:
@@ -129,6 +156,16 @@ class PortfolioRisk:
             reasons.append("maximum_new_positions_today_reached")
         if portfolio.monthly_return_pct <= -s.monthly_stop_loss_pct:
             reasons.append("monthly_loss_stop_reached")
+        if (
+            requires_topdown
+            and portfolio.monthly_return_pct <= -s.monthly_warning_loss_pct
+            and topdown_score is not None
+            and (
+                topdown_score.total_score is None
+                or topdown_score.total_score < s.highest_grade_score
+            )
+        ):
+            reasons.append("monthly_loss_warning_highest_grade_required")
         if portfolio.daily_realized_loss_pct >= self.risk_settings.daily_loss_warning_pct:
             reasons.append("daily_realized_loss_stop_reached")
         if portfolio.weekly_realized_loss_pct >= self.risk_settings.weekly_loss_warning_pct:
@@ -147,6 +184,21 @@ class PortfolioRisk:
         if quote is None or quote.symbol != signal.symbol or quote.last_price is None:
             reasons.append("fresh_matching_broker_quote_required")
         else:
+            if not quote.execution_state_verified:
+                reasons.append("broker_quote_execution_state_unverified")
+            elif quote.suspended:
+                reasons.append("broker_quote_suspended")
+            elif quote.limit_locked:
+                reasons.append("broker_quote_price_limit_locked")
+            if not quote.name.strip():
+                reasons.append("broker_quote_security_name_required")
+            if requires_topdown and not expected_security_name.strip():
+                reasons.append("expected_pool_security_name_required")
+            elif (
+                expected_security_name.strip()
+                and quote.name.strip() != expected_security_name.strip()
+            ):
+                reasons.append("broker_quote_security_name_mismatch")
             try:
                 captured = datetime.fromisoformat(quote.captured_at)
                 age = (datetime.now(UTC).astimezone() - captured).total_seconds()
@@ -177,7 +229,7 @@ class PortfolioRisk:
             or portfolio.total_strategy_drawdown_pct >= s.drawdown_reduce_pct
         ):
             effective_pct /= 2
-        if trading_channel == "outside_pool_exception":
+        if manual_exception:
             effective_pct *= 0.5
         effective = self.risk_settings.model_copy(update={
             "account_equity": broker.total_equity,
@@ -238,6 +290,7 @@ class PortfolioRisk:
             plan_id=plan_id,
             account_fingerprint=broker.account_fingerprint,
             symbol=signal.symbol,
+            name=broker.quote.name,
             direction="buy",
             price=signal.trigger_price,
             quantity=quantity,

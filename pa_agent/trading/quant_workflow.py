@@ -12,7 +12,11 @@ from pa_agent.trading.quant import (
     StrategyContext,
 )
 from pa_agent.trading.store import TradeStore
-from pa_agent.trading.topdown import TOPDOWN_STRATEGY_ID, TopDownScoreSnapshot
+from pa_agent.trading.topdown import (
+    MANUAL_EXCEPTION_STRATEGY_ID,
+    TOPDOWN_STRATEGY_ID,
+    TopDownScoreSnapshot,
+)
 
 
 class QuantTradingWorkflow:
@@ -92,12 +96,19 @@ class QuantTradingWorkflow:
         the frozen intraday score is eligible for portfolio risk authorization.
         """
         daily = self.strategy.evaluate(context)
+        manual_exception = daily.strategy_id == MANUAL_EXCEPTION_STRATEGY_ID
+        plan_strategy_id = (
+            MANUAL_EXCEPTION_STRATEGY_ID if manual_exception else TOPDOWN_STRATEGY_ID
+        )
+        snapshot = dict(daily.condition_snapshot)
         decision = daily.model_copy(update={
-            "strategy_id": TOPDOWN_STRATEGY_ID,
+            "strategy_id": plan_strategy_id,
             "parameter_version": f"{daily.parameter_version}+{score.scoring_version}",
             "condition_snapshot": {
-                **daily.condition_snapshot,
-                "daily_baseline_strategy": daily.strategy_id,
+                **snapshot,
+                "daily_baseline_strategy": snapshot.get(
+                    "daily_baseline_strategy", daily.strategy_id
+                ),
                 "topdown_score": score.model_dump(mode="json"),
             },
         })
@@ -149,12 +160,19 @@ class QuantTradingWorkflow:
         This method never creates an ``AuthorizedOrder``.  Broker synchronization
         and portfolio authorization remain a separate, user-triggered boundary.
         """
+        manual_exception = daily.strategy_id == MANUAL_EXCEPTION_STRATEGY_ID
+        plan_strategy_id = (
+            MANUAL_EXCEPTION_STRATEGY_ID if manual_exception else TOPDOWN_STRATEGY_ID
+        )
+        snapshot = dict(daily.condition_snapshot)
         decision = daily.model_copy(update={
-            "strategy_id": TOPDOWN_STRATEGY_ID,
+            "strategy_id": plan_strategy_id,
             "parameter_version": f"{daily.parameter_version}+{score.scoring_version}",
             "condition_snapshot": {
-                **daily.condition_snapshot,
-                "daily_baseline_strategy": daily.strategy_id,
+                **snapshot,
+                "daily_baseline_strategy": snapshot.get(
+                    "daily_baseline_strategy", daily.strategy_id
+                ),
                 "topdown_score": score.model_dump(mode="json"),
             },
         })
@@ -196,7 +214,7 @@ class QuantTradingWorkflow:
         for plan in self.store.list_plans(symbol=daily.symbol):
             stored = plan.get("risk_snapshot") or {}
             if (
-                plan.get("strategy_version") == TOPDOWN_STRATEGY_ID
+                plan.get("strategy_version") == plan_strategy_id
                 and (stored.get("topdown_score") or {}).get("input_hash") == score.input_hash
             ):
                 response.update({
@@ -216,13 +234,22 @@ class QuantTradingWorkflow:
             original_decision=deterministic,
             final_decision=deterministic,
             meta={
-                "strategy_version": TOPDOWN_STRATEGY_ID,
+                "strategy_version": plan_strategy_id,
                 "feature_version": decision.parameter_version,
                 "model_name": "deterministic",
             },
-            market_state="topdown_4321_intraday_gate",
+            market_state=(
+                "manual_exception_topdown_4321_intraday_gate"
+                if manual_exception
+                else "topdown_4321_intraday_gate"
+            ),
             confidence=None,
-            audit_reason="daily_candidate_then_closed_15m_topdown_gate; no_ai_execution_input",
+            audit_reason=(
+                "manual_exception_daily_candidate_then_closed_15m_topdown_gate; "
+                "half_risk_and_explicit_user_approval_required; no_ai_execution_input"
+                if manual_exception
+                else "daily_candidate_then_closed_15m_topdown_gate; no_ai_execution_input"
+            ),
         )
         plan = TradePlan(
             id=uuid.uuid4().hex,
@@ -238,11 +265,22 @@ class QuantTradingWorkflow:
             valid_until=decision.valid_until,
             status=PlanStatus.PROPOSED,
             shadow_status="proposed",
-            strategy_version=TOPDOWN_STRATEGY_ID,
+            strategy_version=plan_strategy_id,
             risk_snapshot={
-                "source": "deterministic_topdown_4321",
+                "source": (
+                    "deterministic_manual_exception_4321"
+                    if manual_exception
+                    else "deterministic_topdown_4321"
+                ),
                 "parameter_version": decision.parameter_version,
                 "pool_version": decision.pool_version,
+                "base_pool_version": snapshot.get("base_pool_version", ""),
+                "expected_security_name": snapshot.get(
+                    "expected_security_name", ""
+                ),
+                "industry": snapshot.get("industry", ""),
+                "risk_multiplier": 0.5 if manual_exception else 1.0,
+                "max_concurrent_positions": 1 if manual_exception else None,
                 "daily_condition_snapshot": daily.condition_snapshot,
                 "entry_timeframe": "15m",
                 "management_timeframe": "1d",

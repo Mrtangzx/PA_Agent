@@ -111,6 +111,7 @@ class BrokerQuote(BaseModel):
     lower_limit: float | None = Field(default=None, gt=0)
     suspended: bool = False
     limit_locked: bool = False
+    execution_state_verified: bool = True
     captured_at: str = ""
 
 
@@ -124,6 +125,9 @@ class BrokerSnapshot(BaseModel):
     positions: list[BrokerPosition] = Field(default_factory=list)
     orders: list[BrokerOrder] = Field(default_factory=list)
     fills: list[BrokerFill] = Field(default_factory=list)
+    positions_complete: bool = False
+    orders_complete: bool = False
+    fills_complete: bool = False
     cash_flows: list[BrokerCashFlow] = Field(default_factory=list)
     cash_flow_complete: bool = False
     cash_flow_range_start: str = ""
@@ -167,6 +171,14 @@ class AuthorizedOrder(BaseModel):
 
 
 class PrefillReceipt(BaseModel):
+    status: str
+    message: str = ""
+    verified_fields: dict[str, str | int | float] = Field(default_factory=dict)
+    created_at: str
+    final_confirmation_clicked: bool = False
+
+
+class PrefillClearReceipt(BaseModel):
     status: str
     message: str = ""
     verified_fields: dict[str, str | int | float] = Field(default_factory=dict)

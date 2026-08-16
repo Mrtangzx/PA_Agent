@@ -1,7 +1,7 @@
-"""Tests for QClaw auto-fallback on network errors."""
+"""Codex-only orchestration never falls back to another provider."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import openai
 
@@ -10,18 +10,15 @@ from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from tests.fixtures.validators import schema_test_validator
 
 
-def test_stream_chat_retries_after_qclaw_fallback() -> None:
+def test_stream_chat_does_not_switch_provider_on_connection_error() -> None:
     settings = Settings()
     settings.provider.model = "openclaw"
     settings.provider.base_url = "http://127.0.0.1:53555/v1"
 
     client = MagicMock()
-    client.stream_chat.side_effect = [
-        openai.APIConnectionError(request=MagicMock(), message="Connection error."),
-        MagicMock(content='{"gate_result":"wait"}', reasoning_content="", raw={}, usage=MagicMock(
-            prompt_tokens=1, completion_tokens=1, total_tokens=2, cached_prompt_tokens=0
-        ), latency_ms=1.0),
-    ]
+    client.stream_chat.side_effect = openai.APIConnectionError(
+        request=MagicMock(), message="Connection error."
+    )
 
     orchestrator = TwoStageOrchestrator(
         client=client,
@@ -33,11 +30,7 @@ def test_stream_chat_retries_after_qclaw_fallback() -> None:
         settings=settings,
     )
 
-    with patch.object(
-        orchestrator,
-        "_try_qclaw_fallback",
-        return_value=True,
-    ) as fallback:
+    try:
         orchestrator._stream_chat_resilient(
             [{"role": "user", "content": "hi"}],
             on_reasoning_token=None,
@@ -47,18 +40,18 @@ def test_stream_chat_retries_after_qclaw_fallback() -> None:
             reasoning_effort="max",
             stage_label="Stage 1",
         )
+    except openai.APIConnectionError:
+        pass
+    assert client.stream_chat.call_count == 1
+    assert not hasattr(orchestrator, "_try_qclaw_fallback")
+    assert not hasattr(orchestrator, "_try_cursor_fallback")
+    assert not hasattr(orchestrator, "_try_workbuddy_fallback")
 
-    fallback.assert_called_once()
-    assert client.stream_chat.call_count == 2
 
-
-def test_stream_chat_does_not_retry_when_qclaw_unavailable() -> None:
+def test_stream_chat_forwards_codex_reasoning_settings() -> None:
     settings = Settings()
     client = MagicMock()
-    client.stream_chat.side_effect = openai.APIConnectionError(
-        request=MagicMock(),
-        message="Connection error.",
-    )
+    client.stream_chat.return_value = MagicMock()
 
     orchestrator = TwoStageOrchestrator(
         client=client,
@@ -70,39 +63,15 @@ def test_stream_chat_does_not_retry_when_qclaw_unavailable() -> None:
         settings=settings,
     )
 
-    with patch.object(orchestrator, "_try_qclaw_fallback", return_value=False):
-        try:
-            orchestrator._stream_chat_resilient(
-                [{"role": "user", "content": "hi"}],
-                on_reasoning_token=None,
-                on_content_token=None,
-                cancel_token=MagicMock(is_set=MagicMock(return_value=False)),
-                thinking=True,
-                reasoning_effort="max",
-                stage_label="Stage 1",
-            )
-        except openai.APIConnectionError:
-            pass
-
-    assert client.stream_chat.call_count == 1
-
-
-def test_qclaw_fallback_skipped_for_non_openclaw_model() -> None:
-    settings = Settings()
-    settings.provider.model = "deepseek-v4-pro"
-
-    orchestrator = TwoStageOrchestrator(
-        client=MagicMock(),
-        assembler=MagicMock(),
-        router=MagicMock(),
-        validator=schema_test_validator(),
-        pending_writer=MagicMock(),
-        exp_reader=MagicMock(),
-        settings=settings,
+    cancel = MagicMock(is_set=MagicMock(return_value=False))
+    orchestrator._stream_chat_resilient(
+        [{"role": "user", "content": "hi"}],
+        on_reasoning_token=None,
+        on_content_token=None,
+        cancel_token=cancel,
+        thinking=True,
+        reasoning_effort="high",
+        stage_label="Stage 1",
     )
-
-    with patch(
-        "pa_agent.ai.qclaw_connector.apply_qclaw_provider_to_settings"
-    ) as apply:
-        assert not orchestrator._try_qclaw_fallback(original_model="deepseek-v4-pro")
-        apply.assert_not_called()
+    assert client.stream_chat.call_count == 1
+    assert client.stream_chat.call_args.kwargs["reasoning_effort"] == "high"

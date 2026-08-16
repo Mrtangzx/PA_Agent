@@ -26,6 +26,8 @@ from pa_agent.trading.topdown_market_data import (
 from pa_agent.trading.universe import (
     CurrentHs300UniverseService,
     FixedCloudAiUniverseService,
+    ManagedAshareUniverseService,
+    UniverseMutationResult,
     UniverseSnapshot,
 )
 
@@ -33,6 +35,7 @@ __all__ = [
     "AssetClass",
     "CurrentHs300UniverseService",
     "FixedCloudAiUniverseService",
+    "ManagedAshareUniverseService",
     "DailyCandidateScanResult",
     "DailyCandidateScanner",
     "Execution",
@@ -54,4 +57,5 @@ __all__ = [
     "TradePlan",
     "TradeResult",
     "UniverseSnapshot",
+    "UniverseMutationResult",
 ]

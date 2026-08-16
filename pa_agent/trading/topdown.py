@@ -15,6 +15,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 TOPDOWN_STRATEGY_ID = "cloud_ai_topdown_4321_intraday_v1"
+TOPDOWN_SCORING_VERSION = "1.1.1"
 LEGACY_TOPDOWN_STRATEGY_ID = "hs300_topdown_4321_intraday_v1"
 MANUAL_EXCEPTION_STRATEGY_ID = "manual_exception_4321_v1"
 REQUIRED_INDEX_WEIGHTS = {
@@ -41,7 +42,7 @@ class TopDownScoringSettings(BaseModel):
 
     enabled: bool = True
     strategy_version: str = TOPDOWN_STRATEGY_ID
-    scoring_version: str = "1.0.0"
+    scoring_version: str = TOPDOWN_SCORING_VERSION
     bar_timeframe: str = "15m"
     observe_threshold: float = Field(default=60.0, ge=0, le=100)
     pass_threshold: float = Field(default=70.0, ge=0, le=100)
@@ -95,18 +96,26 @@ class HotspotItem(BaseModel):
     major_negative: bool = False
     related_themes: list[str] = Field(default_factory=list)
     risk_code: str = ""
+    time_valid: bool = False
+    time_validation_reason: str = ""
 
 
 class HotspotSnapshot(BaseModel):
     symbol: str
     captured_at: str
     frozen_at: str
+    validation_epoch_id: str = ""
+    pool_version: str = ""
+    member_hash: str = ""
     industries: list[str] = Field(default_factory=list)
     concepts: list[str] = Field(default_factory=list)
     items: list[HotspotItem] = Field(default_factory=list)
     board_strength: dict[str, Any] = Field(default_factory=dict)
     positive_score: float = Field(default=0, ge=0, le=3)
     negative_blocks: list[str] = Field(default_factory=list)
+    data_gaps: list[str] = Field(default_factory=list)
+    rule_version: str = ""
+    effective_windows_days: dict[str, int] = Field(default_factory=dict)
     source_hash: str = ""
 
     def with_source_hash(self) -> HotspotSnapshot:
@@ -204,7 +213,11 @@ class TopDownScoring:
                 data_gaps=data_gaps,
                 source_timestamps=source_timestamps,
                 input_hash=input_hash,
-                status=TopDownScoreStatus.DATA_INCOMPLETE,
+                status=(
+                    TopDownScoreStatus.AUTHORIZATION_REVOKED
+                    if context.authorization_open
+                    else TopDownScoreStatus.DATA_INCOMPLETE
+                ),
             )
 
         assert context.sentiment and context.theme and context.stock
@@ -224,7 +237,10 @@ class TopDownScoring:
         if (
             passed_now
             and previous is not None
+            and previous.strategy_version == s.strategy_version
+            and previous.scoring_version == s.scoring_version
             and previous.symbol == context.symbol
+            and previous.pool_version == context.pool_version
             and previous.total_score is not None
             and previous.total_score >= s.pass_threshold
             and not previous.hard_blocks
@@ -278,6 +294,8 @@ class TopDownScoring:
             gaps.append("missing_sentiment")
         if context.theme is None:
             gaps.append("missing_theme")
+        elif context.theme.hotspot.data_gaps:
+            gaps.extend(context.theme.hotspot.data_gaps)
         if context.stock is None:
             gaps.append("missing_stock")
         if not context.pool_version:
@@ -371,7 +389,10 @@ class TopDownScoring:
         blocks.extend(
             f"major_negative_{value.risk_code or value.item_id}"
             for value in item.hotspot.items
-            if value.official and value.verified and value.major_negative
+            if value.official
+            and value.verified
+            and value.time_valid
+            and value.major_negative
         )
         details = {
             "relative_strength": round(relative, 4),

@@ -1,8 +1,7 @@
 """AI 模型设置对话框 — 只包含 AI 提供商相关字段."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -13,7 +12,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -21,25 +19,7 @@ from PyQt6.QtWidgets import (
 
 from pa_agent.config.settings import Settings, save_settings
 from pa_agent.config.paths import SETTINGS_JSON_PATH
-from pa_agent.ai.cursor_connector import (
-    is_openclaw_cs_model,
-    should_use_cursor_provider,
-)
-from pa_agent.ai.qclaw_connector import (
-    detect_qclaw,
-    is_openclaw_model,
-    should_use_qclaw_provider,
-)
-from pa_agent.ai.workbuddy_connector import (
-    detect_workbuddy,
-    is_openclaw_wb_model,
-    should_use_workbuddy_provider,
-)
-
-_API_KEY_HELP_URL = "https://my.feishu.cn/wiki/CUV1wUKWxiQGhekQdRvcZQQ2ncf"
-_AGENT_TUTORIAL_URL = (
-    "https://my.feishu.cn/wiki/BEdFwGJhaiATbukuD2HccSXCnrb?from=from_copylink"
-)
+from pa_agent.config.settings import normalize_codex_provider
 
 
 class AIModelSettingsDialog(QDialog):
@@ -62,9 +42,8 @@ class AIModelSettingsDialog(QDialog):
         form = QFormLayout(provider_group)
 
         self._backend_combo = QComboBox()
-        self._backend_combo.addItem("OpenAI 兼容 API", "openai_compatible")
-        self._backend_combo.addItem("Codex SDK（本地 Agent）", "codex_sdk")
-        self._backend_combo.addItem("Cursor SDK", "cursor_sdk")
+        self._backend_combo.addItem("Codex SDK（本机登录）", "codex_sdk")
+        self._backend_combo.setEnabled(False)
         self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
         form.addRow("运行方式:", self._backend_combo)
 
@@ -93,18 +72,12 @@ class AIModelSettingsDialog(QDialog):
         self._reasoning_effort_combo.addItems(["low", "medium", "high", "max"])
         form.addRow("Reasoning Effort:", self._reasoning_effort_combo)
 
-        self._api_key_help_btn = QPushButton("小白点这里！获取程序无限Token，无限分析")
-        self._api_key_help_btn.setStyleSheet(
-            "QPushButton { font-size: 13pt; font-weight: bold; "
-            "padding: 8px 16px; }"
+        self._codex_help = QLabel(
+            "所有模型访问统一通过 Codex SDK。认证使用本机 Codex 登录状态，"
+            "PA Agent 不保存 API Key，也不使用第三方模型网关。"
         )
-        self._api_key_help_btn.clicked.connect(self._show_unlimited_token_info)
-        form.addRow("", self._api_key_help_btn)
-
-        self._agent_tutorial_btn = QPushButton("智能体使用教程及问题解决方法")
-        self._agent_tutorial_btn.setToolTip(_AGENT_TUTORIAL_URL)
-        self._agent_tutorial_btn.clicked.connect(self._open_agent_tutorial_url)
-        form.addRow("", self._agent_tutorial_btn)
+        self._codex_help.setWordWrap(True)
+        form.addRow("说明:", self._codex_help)
 
         root.addWidget(provider_group)
 
@@ -130,10 +103,7 @@ class AIModelSettingsDialog(QDialog):
         self._base_url_edit.setText(p.base_url)
         self._api_key_edit.setText(p.api_key)
         self._thinking_check.setChecked(p.thinking)
-        backend = getattr(p, "backend", "openai_compatible")
-        if backend == "openai_compatible" and is_openclaw_cs_model(p.model):
-            backend = "cursor_sdk"
-        backend_idx = self._backend_combo.findData(backend)
+        backend_idx = self._backend_combo.findData("codex_sdk")
         if backend_idx >= 0:
             self._backend_combo.blockSignals(True)
             self._backend_combo.setCurrentIndex(backend_idx)
@@ -146,55 +116,8 @@ class AIModelSettingsDialog(QDialog):
     def _on_save(self) -> None:
         p = self._settings.provider
         model = self._model_edit.text().strip()
-        base_url = self._base_url_edit.text().strip()
-        api_key = self._api_key_edit.text().strip()
-        backend = str(self._backend_combo.currentData() or "openai_compatible")
-
-        # Explicit model aliases win over stale base_url (openclaw_wb before openclaw).
-        if backend == "codex_sdk":
-            p.backend = "codex_sdk"
-            p.model = model or "gpt-5.6-terra"
-            p.base_url = ""
-        elif backend == "cursor_sdk":
-            p.backend = "cursor_sdk"
-            p.api_key = api_key
-            err = self._apply_cursor_provider(preferred_model=model or "openclaw_cs")
-            if err:
-                QMessageBox.warning(self, "Cursor 配置异常", err)
-                return
-        elif is_openclaw_wb_model(model) or should_use_workbuddy_provider(model, base_url):
-            p.backend = "openai_compatible"
-            p.api_key = api_key
-            err = self._apply_workbuddy_provider(preferred_model=model)
-            if err:
-                QMessageBox.warning(self, "WorkBuddy 配置异常", err)
-                return
-        elif is_openclaw_cs_model(model) or should_use_cursor_provider(model, base_url):
-            # Cursor route must keep the user-provided Cursor API key (crsr_...).
-            p.api_key = api_key
-            err = self._apply_cursor_provider(preferred_model=model)
-            if err:
-                QMessageBox.warning(self, "Cursor 配置异常", err)
-                return
-        elif is_openclaw_model(model) or should_use_qclaw_provider(model, base_url):
-            p.backend = "openai_compatible"
-            p.api_key = api_key
-            err = self._apply_qclaw_provider(preferred_model=model)
-            if err:
-                QMessageBox.warning(self, "QClaw 配置异常", err)
-                return
-        else:
-            p.backend = "openai_compatible"
-            field_err = self._validate_provider_fields(model, base_url)
-            if field_err:
-                QMessageBox.warning(self, "AI 提供商配置有误", field_err)
-                return
-            p.model = model
-            p.base_url = base_url
-            p.api_key = api_key
-
-        p.thinking = self._thinking_check.isChecked()
-        p.reasoning_effort = self._reasoning_effort_combo.currentText()  # type: ignore[assignment]
+        p.model = model or "gpt-5.6-terra"
+        normalize_codex_provider(p)
 
         save_settings(self._settings, SETTINGS_JSON_PATH)
         self.accept()
@@ -210,31 +133,21 @@ class AIModelSettingsDialog(QDialog):
         self._api_key_edit.selectAll()
 
     def _on_backend_changed(self) -> None:
-        backend = str(self._backend_combo.currentData() or "openai_compatible")
-        is_codex = backend == "codex_sdk"
-        is_cursor = backend == "cursor_sdk"
-        self._base_url_edit.setEnabled(not (is_codex or is_cursor))
-        self._api_key_edit.setEnabled(not is_codex)
-        self._show_key_btn.setEnabled(not is_codex)
-
-        if is_codex:
-            if not self._model_edit.text().strip().lower().startswith("gpt-"):
-                self._model_edit.setText("gpt-5.6-terra")
-            self._base_url_edit.setPlaceholderText("Codex SDK 不使用 Base URL")
-            self._api_key_edit.setPlaceholderText("使用本机 Codex 登录状态，无需 API Key")
-            self._backend_combo.setToolTip(
-                "通过官方 openai-codex SDK 启动本地只读 Agent；使用本机 Codex 登录状态。"
-            )
-        elif is_cursor:
-            if not is_openclaw_cs_model(self._model_edit.text()):
-                self._model_edit.setText("openclaw_cs")
-            self._base_url_edit.setPlaceholderText("Cursor SDK 不使用 Base URL")
-            self._api_key_edit.setPlaceholderText("输入 Cursor API Key（crsr_...）")
-            self._backend_combo.setToolTip("")
-        else:
-            self._base_url_edit.setPlaceholderText("")
-            self._api_key_edit.setPlaceholderText("输入 API Key")
-            self._backend_combo.setToolTip("")
+        if not self._model_edit.text().strip().lower().startswith("gpt-"):
+            self._model_edit.setText("gpt-5.6-terra")
+        self._base_url_edit.clear()
+        self._api_key_edit.clear()
+        self._base_url_edit.setEnabled(False)
+        self._api_key_edit.setEnabled(False)
+        self._show_key_btn.setEnabled(False)
+        self._thinking_check.setChecked(True)
+        self._thinking_check.setEnabled(False)
+        high_index = self._reasoning_effort_combo.findText("high")
+        self._reasoning_effort_combo.setCurrentIndex(high_index)
+        self._reasoning_effort_combo.setEnabled(False)
+        self._base_url_edit.setPlaceholderText("Codex SDK 不使用 Base URL")
+        self._api_key_edit.setPlaceholderText("使用本机 Codex 登录状态，无需 API Key")
+        self._backend_combo.setToolTip("生产环境只允许 Codex SDK")
 
     def _toggle_api_key_visibility(self, checked: bool) -> None:
         if checked:
@@ -243,80 +156,3 @@ class AIModelSettingsDialog(QDialog):
         else:
             self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Normal)
             self._show_key_btn.setText("隐藏")
-
-    def _apply_cursor_provider(self, *, preferred_model: str = "") -> str | None:
-        from pa_agent.ai.cursor_connector import apply_cursor_provider_to_settings
-        return apply_cursor_provider_to_settings(self._settings, preferred_model=preferred_model or None)
-
-    def _apply_qclaw_provider(self, *, preferred_model: str = "") -> str | None:
-        from pa_agent.ai.qclaw_connector import apply_qclaw_provider_to_settings
-        return apply_qclaw_provider_to_settings(self._settings, preferred_model=preferred_model or None)
-
-    def _apply_workbuddy_provider(self, *, preferred_model: str = "") -> str | None:
-        from pa_agent.ai.workbuddy_connector import apply_workbuddy_provider_to_settings
-        return apply_workbuddy_provider_to_settings(self._settings, preferred_model=preferred_model or None)
-
-    @staticmethod
-    def _validate_provider_fields(model: str, base_url: str) -> str | None:
-        if is_openclaw_cs_model(model) or should_use_cursor_provider(model, base_url):
-            return None
-        if is_openclaw_model(model) or should_use_qclaw_provider(model, base_url):
-            return None
-        if is_openclaw_wb_model(model) or should_use_workbuddy_provider(model, base_url):
-            return None
-        if model.startswith(("http://", "https://")) and not base_url.startswith(("http://", "https://")):
-            return (
-                "「模型」与「Base URL」似乎填反了：\n"
-                "• 模型应填模型名，如 deepseek-v4-pro 或 claude-sonnet-4-6\n"
-                "• 使用 QClaw 时模型填 openclaw（或 openclaw/main）\n"
-                "• 使用 Cursor 订阅时模型填 openclaw_cs\n"
-                "• 使用 WorkBuddy 时模型填 openclaw_wb\n"
-                "• Base URL 应填接口地址，如 https://api.deepseek.com"
-            )
-        if base_url.startswith(("http://", "https://")):
-            return None
-        if not base_url:
-            if detect_qclaw():
-                return (
-                    "请填写 Base URL，或使用 QClaw/WorkBuddy：\n"
-                    "• 模型填 openclaw → QClaw\n"
-                    "• 模型填 openclaw_cs → Cursor 订阅（经 QClaw 网关）\n"
-                    "• 模型填 openclaw_wb → WorkBuddy"
-                )
-            if detect_workbuddy():
-                return "请填写 Base URL，或使用 WorkBuddy：\n• 模型填 openclaw_wb（保存时自动配置）"
-            return "请填写 Base URL（API 接口地址）。"
-        return (
-            f"Base URL 不是有效网址（当前：{base_url}）。\n"
-            "DeepSeek 示例：https://api.deepseek.com\n"
-            "PackyAPI 示例：https://www.packyapi.com/v1\n"
-            "QClaw：模型填 openclaw 后点保存（自动配置本地网关）\n"
-            "Cursor：模型填 openclaw_cs 后点保存（经 QClaw 走 Cursor 订阅）\n"
-            "WorkBuddy：模型填 openclaw_wb 后点保存（自动配置 WorkBuddy）"
-        )
-
-    def _show_unlimited_token_info(self) -> None:
-        from PyQt6.QtWidgets import QDialog as _QDialog
-        dlg = _QDialog(self)
-        dlg.setWindowTitle("获取无限Token")
-        from PyQt6.QtWidgets import QVBoxLayout as _VBox, QDialogButtonBox as _DBB
-        layout = _VBox(dlg)
-        label = QLabel(
-            "获取无限Token方法需付费49.9元，付费后你将获得<br>"
-            "Deepseek V4 Pro/GLM5.1/Kimi2.6等\"满血\"模型的无限分析方法<br>"
-            "注意无限Token只支持使用这个分析软件<br>"
-            "如果你愿意付费，请联系QQ：564020069（付费后提供远程协助部署安装服务）<br><br>"
-            "如果你不愿意付费，你可以用自己的模型api，如果你不知道模型api是什么<br>"
-            "可以直接跟龙虾说：<br>"
-            "PA_Agent这个程序的模型api有什么作用，该怎么填？<br>"
-            "请教我填上Deepseek官方的模型API接口"
-        )
-        label.setStyleSheet("font-size: 22pt;")
-        layout.addWidget(label)
-        bb = _DBB(_DBB.StandardButton.Ok)
-        bb.accepted.connect(dlg.accept)
-        layout.addWidget(bb)
-        dlg.exec()
-
-    def _open_agent_tutorial_url(self) -> None:
-        QDesktopServices.openUrl(QUrl(_AGENT_TUTORIAL_URL))

@@ -1,5 +1,6 @@
 """Pydantic settings models for PA Agent."""
 from __future__ import annotations
+
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -8,26 +9,42 @@ from pa_agent.trading.broker_models import ThsBinding
 from pa_agent.trading.models import RiskSettings
 from pa_agent.trading.portfolio import PortfolioRiskSettings
 from pa_agent.trading.quant import StrategySettings
-from pa_agent.trading.topdown import TopDownScoringSettings
+from pa_agent.trading.stock_selection import StockSelectionSettings
+from pa_agent.trading.topdown import (
+    TOPDOWN_SCORING_VERSION,
+    TOPDOWN_STRATEGY_ID,
+    TopDownScoringSettings,
+)
 
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
 DataSourceKind = Literal["mt5", "tradingview", "akshare", "eastmoney", "eastmoney_futures", "tushare"]
 NormalizationMode = Literal["strict", "lenient"]
+# Legacy values remain parseable so existing JSON can be migrated safely. The
+# runtime normalizer below makes only ``codex_sdk`` reachable in production.
 AIBackend = Literal["openai_compatible", "cursor_sdk", "codex_sdk"]
+
+
+class CodexProcessSettings(BaseModel):
+    """Local Codex app-server process settings."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    hide_console_on_windows: bool = True
 
 
 class AIProviderSettings(BaseModel):
     """AI provider connection and behaviour settings."""
     model_config = ConfigDict(extra="ignore")
 
-    backend: AIBackend = "openai_compatible"
-    model: str = "deepseek-v4-flash"
-    base_url: str = "https://api.deepseek.com"
+    backend: AIBackend = "codex_sdk"
+    model: str = "gpt-5.6-terra"
+    base_url: str = ""
     api_key: str = ""
     api_key_encrypted: str = ""
     thinking: bool = True
     reasoning_effort: Literal["low", "medium", "high", "max"] = "high"
     context_window: int = 2_000_000
+    codex_process: CodexProcessSettings = Field(default_factory=CodexProcessSettings)
 
 
 class PromptSettings(BaseModel):
@@ -70,12 +87,13 @@ class GeneralSettings(BaseModel):
     analysis_bar_count: int = Field(default=150, ge=2, le=5000)
     refresh_interval_ms: int = 1000
     context_warning_threshold_pct: float = 80.0
-    last_data_source: DataSourceKind = "mt5"
+    investment_scope: Literal["a_share_only"] = "a_share_only"
+    last_data_source: DataSourceKind = "eastmoney"
     #: A-share K-line adjust for East Money / Baostock (qfq=前复权)
     kline_adjust: Literal["qfq", "hfq", "none"] = "qfq"
     #: TradingView 交易所；空字符串 =（自动）依次探测预设列表
     last_tradingview_exchange: str = ""
-    last_symbol: str = "XAUUSDm"
+    last_symbol: str = "600519"
     last_timeframe: str = "15m"
     decision_flow_auto_play: bool = True
     decision_flow_play_seconds: int = 50
@@ -176,21 +194,69 @@ class Settings(BaseModel):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     strategy: StrategySettings = Field(default_factory=StrategySettings)
     topdown_scoring: TopDownScoringSettings = Field(default_factory=TopDownScoringSettings)
+    stock_selection: StockSelectionSettings = Field(default_factory=StockSelectionSettings)
     portfolio_risk: PortfolioRiskSettings = Field(default_factory=PortfolioRiskSettings)
     ths: ThsBinding = Field(default_factory=ThsBinding)
 
 
 def provider_api_key_configured(settings: Settings | None) -> bool:
-    """Return True when the selected AI backend has usable credentials.
+    """Codex SDK authenticates through the local Codex login, not an API key."""
+    return settings is not None
 
-    Codex SDK authenticates through the local Codex account, so it does not
-    require an API key in PA Agent's settings.
+
+def normalize_codex_provider(provider: AIProviderSettings) -> bool:
+    """Apply the production Codex-only provider policy in place.
+
+    Returns ``True`` when legacy or unsafe values were changed.
     """
-    if settings is None:
-        return False
-    if settings.provider.backend == "codex_sdk":
-        return True
-    return bool((settings.provider.api_key or "").strip())
+    before = (
+        provider.backend,
+        provider.model,
+        provider.base_url,
+        provider.api_key,
+        provider.api_key_encrypted,
+        provider.thinking,
+        provider.reasoning_effort,
+    )
+    provider.backend = "codex_sdk"
+    if not (provider.model or "").strip().lower().startswith("gpt-"):
+        provider.model = "gpt-5.6-terra"
+    provider.base_url = ""
+    provider.api_key = ""
+    provider.api_key_encrypted = ""
+    provider.thinking = True
+    provider.reasoning_effort = "high"
+    after = (
+        provider.backend,
+        provider.model,
+        provider.base_url,
+        provider.api_key,
+        provider.api_key_encrypted,
+        provider.thinking,
+        provider.reasoning_effort,
+    )
+    return before != after
+
+
+def normalize_a_share_only_general(general: GeneralSettings) -> bool:
+    """Keep the production analysis and investment surface A-share-only."""
+    from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+    before = (
+        general.investment_scope,
+        general.last_data_source,
+        general.last_symbol,
+    )
+    general.investment_scope = "a_share_only"
+    general.last_data_source = "eastmoney"
+    if not is_a_share_stock_symbol(general.last_symbol):
+        general.last_symbol = "600519"
+    after = (
+        general.investment_scope,
+        general.last_data_source,
+        general.last_symbol,
+    )
+    return before != after
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -265,8 +331,22 @@ def load_settings(path: Path | None = None) -> "Settings":
         general["analysis_bar_count"] = general.pop("default_bar_count")
     raw["general"] = general
     provider = raw.get("provider", {})
+    original_provider = dict(provider)
     provider.pop("pricing", None)
+    provider["backend"] = "codex_sdk"
+    if not str(provider.get("model") or "").strip().lower().startswith("gpt-"):
+        provider["model"] = "gpt-5.6-terra"
+    provider["base_url"] = ""
+    provider["api_key"] = ""
+    provider["api_key_encrypted"] = ""
+    provider["thinking"] = True
+    provider["reasoning_effort"] = "high"
+    provider.setdefault(
+        "codex_process",
+        CodexProcessSettings().model_dump(mode="json"),
+    )
     raw["provider"] = provider
+    migrated_provider = provider != original_provider
 
     # Migrate legacy encrypted key: drop it, api_key already in provider dict
     raw.setdefault("provider", {}).setdefault("api_key", "")
@@ -280,10 +360,23 @@ def load_settings(path: Path | None = None) -> "Settings":
         migrated_quant_universe = True
     topdown = raw.setdefault("topdown_scoring", {})
     if topdown.get("strategy_version") == "hs300_topdown_4321_intraday_v1":
-        topdown["strategy_version"] = "cloud_ai_topdown_4321_intraday_v1"
+        topdown["strategy_version"] = TOPDOWN_STRATEGY_ID
+        migrated_quant_universe = True
+    if (
+        topdown.get("strategy_version", TOPDOWN_STRATEGY_ID) == TOPDOWN_STRATEGY_ID
+        and topdown.get("scoring_version") != TOPDOWN_SCORING_VERSION
+    ):
+        topdown["scoring_version"] = TOPDOWN_SCORING_VERSION
         migrated_quant_universe = True
     settings = Settings.model_validate(raw)
-    dirty = migrated_feishu or migrated_quant_universe
+    migrated_provider = normalize_codex_provider(settings.provider) or migrated_provider
+    migrated_scope = normalize_a_share_only_general(settings.general)
+    dirty = (
+        migrated_feishu
+        or migrated_quant_universe
+        or migrated_provider
+        or migrated_scope
+    )
     if settings.pushplus.enabled and not settings.pushplus.token.strip():
         if not (os.environ.get("PUSHPLUS_TOKEN") or "").strip():
             settings.pushplus.enabled = False
@@ -304,6 +397,8 @@ def save_settings(settings: "Settings", path: Path | None = None) -> None:
     path = path or SETTINGS_JSON_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    normalize_codex_provider(settings.provider)
+    normalize_a_share_only_general(settings.general)
     data = settings.model_dump()
 
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

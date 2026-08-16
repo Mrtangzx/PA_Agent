@@ -5,20 +5,24 @@ import json
 from unittest.mock import patch
 
 from pa_agent.config.settings import Settings, load_settings, save_settings
-from pa_agent.trading.topdown import TOPDOWN_STRATEGY_ID
+from pa_agent.trading.topdown import TOPDOWN_SCORING_VERSION, TOPDOWN_STRATEGY_ID
 
 
 def test_defaults(tmp_path):
     """load_settings on a missing file returns defaults and creates the file."""
     p = tmp_path / "settings.json"
     s = load_settings(p)
-    assert s.provider.model == "deepseek-v4-flash"
-    assert s.provider.base_url == "https://api.deepseek.com"
+    assert s.provider.backend == "codex_sdk"
+    assert s.provider.model == "gpt-5.6-terra"
+    assert s.provider.base_url == ""
     assert s.provider.thinking is True
     assert s.provider.reasoning_effort == "high"
     assert s.provider.context_window == 2_000_000
+    assert s.provider.codex_process.hide_console_on_windows is True
     assert s.general.analysis_bar_count == 150
-    assert s.general.last_symbol == "XAUUSDm"
+    assert s.general.investment_scope == "a_share_only"
+    assert s.general.last_data_source == "eastmoney"
+    assert s.general.last_symbol == "600519"
     assert s.general.last_timeframe == "15m"
     assert s.general.decision_stance == "balanced"
     assert s.general.decision_flow_auto_play is True
@@ -26,9 +30,14 @@ def test_defaults(tmp_path):
     assert s.strategy.strategy_id == "cloud_ai_daily_pullback_v1"
     assert s.strategy.stock_pool_size == 11
     assert s.topdown_scoring.strategy_version == TOPDOWN_STRATEGY_ID
+    assert s.topdown_scoring.scoring_version == TOPDOWN_SCORING_VERSION
     assert s.topdown_scoring.consecutive_pass_bars == 2
     assert s.portfolio_risk.initial_per_trade_risk_pct == 0.25
     assert s.portfolio_risk.initial_max_open_risk_pct == 1.0
+    assert s.portfolio_risk.highest_grade_score == 80.0
+    assert s.stock_selection.strategy_version == "a_share_stock_selection_v1"
+    assert s.stock_selection.require_no_major_negative is True
+    assert s.stock_selection.volume_suffocation_max_ratio == 0.65
     assert p.exists(), "defaults should be written to disk"
 
 
@@ -40,10 +49,26 @@ def test_round_trip(tmp_path):
     original.general.last_symbol = "BTCUSDT"
     save_settings(original, p)
     loaded = load_settings(p)
-    assert loaded.provider.api_key == "sk-test-1234"
-    # Crypto symbols migrate to gold defaults on load
-    assert loaded.general.last_symbol == "XAUUSDm"
+    assert loaded.provider.api_key == ""
+    # Non-A-share symbols are removed from the production configuration.
+    assert loaded.general.last_symbol == "600519"
+    assert loaded.general.last_data_source == "eastmoney"
     assert loaded.provider.model == original.provider.model
+
+
+def test_codex_process_settings_round_trip(tmp_path):
+    p = tmp_path / "settings.json"
+    original = Settings()
+    original.provider.codex_process.hide_console_on_windows = False
+
+    save_settings(original, p)
+    loaded = load_settings(p)
+
+    assert loaded.provider.codex_process.hide_console_on_windows is False
+    persisted = json.loads(p.read_text(encoding="utf-8"))
+    assert persisted["provider"]["codex_process"] == {
+        "hide_console_on_windows": False,
+    }
 
 
 def test_legacy_hs300_quant_settings_migrate_to_fixed_cloud_pool(tmp_path):
@@ -65,15 +90,31 @@ def test_legacy_hs300_quant_settings_migrate_to_fixed_cloud_pool(tmp_path):
     assert persisted["strategy"]["stock_pool_size"] == 11
 
 
-def test_api_key_present_on_disk(tmp_path):
-    """The saved JSON contains the plaintext API key."""
+def test_current_topdown_strategy_migrates_old_scoring_version(tmp_path):
+    p = tmp_path / "settings.json"
+    data = Settings().model_dump(mode="json")
+    data["topdown_scoring"]["scoring_version"] = "1.0.0"
+    data["general"]["analysis_bar_count"] = 233
+    p.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = load_settings(p)
+
+    assert loaded.topdown_scoring.scoring_version == TOPDOWN_SCORING_VERSION
+    assert loaded.general.analysis_bar_count == 233
+    persisted = json.loads(p.read_text(encoding="utf-8"))
+    assert persisted["topdown_scoring"]["scoring_version"] == TOPDOWN_SCORING_VERSION
+    assert persisted["general"]["analysis_bar_count"] == 233
+
+
+def test_ai_api_key_is_removed_before_persisting(tmp_path):
     p = tmp_path / "settings.json"
     s = Settings()
     s.provider.api_key = "sk-super-secret-key"
     save_settings(s, p)
     raw = p.read_text(encoding="utf-8")
     data = json.loads(raw)
-    assert data["provider"]["api_key"] == "sk-super-secret-key"
+    assert data["provider"]["api_key"] == ""
+    assert "sk-super-secret-key" not in raw
 
 
 def test_corrupt_json_returns_defaults(tmp_path):
@@ -81,7 +122,7 @@ def test_corrupt_json_returns_defaults(tmp_path):
     p = tmp_path / "settings.json"
     p.write_text("{not valid json", encoding="utf-8")
     s = load_settings(p)
-    assert s.provider.model == "deepseek-v4-flash"
+    assert s.provider.model == "gpt-5.6-terra"
 
 
 def test_missing_api_key_leaves_api_key_blank(tmp_path):

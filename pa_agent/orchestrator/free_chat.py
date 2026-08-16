@@ -1,7 +1,7 @@
 """FreeChatSession — post-analysis free-chat session.
 
 Maintains a conversation history anchored to a completed two-stage
-AnalysisRecord and sends follow-up messages to the DeepSeek API.
+AnalysisRecord and sends follow-up messages through the Codex SDK.
 
 Design reference: design.md §B.17
 """
@@ -12,13 +12,13 @@ import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
-    from pa_agent.ai.deepseek_client import DeepSeekClient
+    from pa_agent.ai.codex_sdk_client import CodexSdkClient
     from pa_agent.ai.prompt_assembler import PromptAssembler
     from pa_agent.ai.session_ledger import SessionTokenLedger
     from pa_agent.config.settings import Settings
     from pa_agent.records.pending_writer import PendingWriter
 
-from pa_agent.ai.deepseek_client import AIReply
+from pa_agent.ai.model_types import AIReply, CancelledError
 from pa_agent.records.schema import AnalysisRecord, FollowupTurn
 from pa_agent.util.threading import CancelToken
 from pa_agent.util.timefmt import now_local_ms
@@ -54,7 +54,7 @@ class FreeChatSession:
     base_record:
         The fully completed AnalysisRecord from the two-stage pipeline.
     client:
-        DeepSeekClient instance for API calls.
+        CodexSdkClient instance for all model calls.
     assembler:
         PromptAssembler kept for future use. Follow-up chat builds its own
         advisory prompt instead of reusing the Stage 2 decision contract.
@@ -78,7 +78,7 @@ class FreeChatSession:
     def __init__(
         self,
         base_record: AnalysisRecord,
-        client: "DeepSeekClient",
+        client: "CodexSdkClient",
         assembler: "PromptAssembler",
         pending_writer: "PendingWriter",
         ledger: "SessionTokenLedger",
@@ -272,7 +272,7 @@ class FreeChatSession:
            - A compact reference summary of the completed analysis.
            - All previous free-chat turns.
            - New user message
-        2. Call ``client.chat(history_for_api, cancel_token=cancel_token)``.
+        2. Call ``client.stream_chat(...)`` through the Codex SDK adapter.
         3. Append to ``_history_full`` (with ``reasoning_content`` preserved).
         4. Call ``ledger.add(reply.usage)`` and
            ``pending_writer.append_followup(record_id, turn)``.
@@ -289,24 +289,12 @@ class FreeChatSession:
         history_for_api: list[dict] = list(self._cached_prefix)  # copy stable prefix
 
         # Previous free-chat turns from history_full
-        preserve_mimo = False
-        if self._settings is not None:
-            from pa_agent.ai.mimo_compat import is_mimo_provider
-
-            provider = getattr(self._settings, "provider", None)
-            if provider is not None:
-                preserve_mimo = is_mimo_provider(
-                    getattr(provider, "base_url", ""),
-                    getattr(provider, "model", ""),
-                )
         for msg in self._history_full:
             if msg["role"] == "user":
                 history_for_api.append({"role": "user", "content": msg["content"]})
             elif msg["role"] == "assistant":
                 assistant_msg: dict = {"role": "assistant", "content": msg["content"]}
-                if (self.keep_reasoning_in_resend or preserve_mimo) and msg.get(
-                    "reasoning_content"
-                ):
+                if self.keep_reasoning_in_resend and msg.get("reasoning_content"):
                     assistant_msg["reasoning_content"] = msg["reasoning_content"]
                 history_for_api.append(assistant_msg)
 
@@ -334,8 +322,6 @@ class FreeChatSession:
             )
 
         # ── 3. Check cancellation before API call ─────────────────────────────
-        from pa_agent.ai.deepseek_client import CancelledError
-
         if cancel_token.is_set():
             # Persist a cancelled turn and re-raise
             cancelled_turn = FollowupTurn(

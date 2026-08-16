@@ -2,12 +2,12 @@
 
 Coordinates the full Stage 1 (diagnosis) → Stage 2 (decision) pipeline:
   1. Build Stage 1 prompt via PromptAssembler
-  2. Call DeepSeekClient
+  2. Call CodexSdkClient
   3. Validate Stage 1 JSON
   4. Route strategy files
   5. Load experience entries
   6. Build Stage 2 prompt
-  7. Call DeepSeekClient
+  7. Call CodexSdkClient
   8. Validate Stage 2 JSON
   9. Persist full record
 
@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
-    from pa_agent.ai.deepseek_client import DeepSeekClient
+    from pa_agent.ai.codex_sdk_client import CodexSdkClient
     from pa_agent.ai.json_validator import JsonValidator
     from pa_agent.ai.prompt_assembler import PromptAssembler
     from pa_agent.config.settings import Settings
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pa_agent.records.pending_writer import PendingWriter
 
 from pa_agent.ai.json_validator import Ok, ValidationError
+from pa_agent.ai.model_types import CancelledError
 from pa_agent.orchestrator.validation_retry import validate_with_retry
 from pa_agent.data.base import KlineFrame
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
@@ -310,7 +311,7 @@ class TwoStageOrchestrator:
     Parameters
     ----------
     client:
-        DeepSeekClient instance for API calls.
+        CodexSdkClient instance for all model calls.
     assembler:
         PromptAssembler for building Stage 1 and Stage 2 message lists.
     router:
@@ -329,7 +330,7 @@ class TwoStageOrchestrator:
 
     def __init__(
         self,
-        client: "DeepSeekClient",
+        client: "CodexSdkClient",
         assembler: "PromptAssembler",
         router: Any,
         validator: "JsonValidator",
@@ -1023,188 +1024,25 @@ class TwoStageOrchestrator:
         reasoning_effort: str,
         stage_label: str,
     ) -> Any:
-        """Call stream_chat; on connection error, switch to QClaw and retry once."""
-        original_model = (
-            self._settings.provider.model if self._settings is not None else ""
-        )
-        tried_qclaw = False
-        tried_cursor = False
-        tried_workbuddy = False
-        while True:
-            try:
-                return self._client.stream_chat(
-                    messages,
-                    on_reasoning_token=on_reasoning_token,
-                    on_content_token=on_content_token,
-                    cancel_token=cancel_token,
-                    thinking=thinking,
-                    reasoning_effort=reasoning_effort,
-                )
-            except Exception as exc:
-                if not self._is_network_error(exc):
-                    raise
-                # Try WorkBuddy fallback first (if model is openclaw_wb),
-                # then QClaw fallback (if model is openclaw)
-                if not tried_workbuddy and self._try_workbuddy_fallback(
-                    original_model=original_model
-                ):
-                    tried_workbuddy = True
-                    logger.info(
-                        "%s network error (%s); applied WorkBuddy provider — retrying",
-                        stage_label,
-                        exc,
-                    )
-                elif not tried_cursor and self._try_cursor_fallback(
-                    original_model=original_model
-                ):
-                    tried_cursor = True
-                    logger.info(
-                        "%s network error (%s); applied Cursor provider — retrying",
-                        stage_label,
-                        exc,
-                    )
-                elif not tried_qclaw and self._try_qclaw_fallback(
-                    original_model=original_model
-                ):
-                    tried_qclaw = True
-                    logger.info(
-                        "%s network error (%s); applied QClaw provider — retrying",
-                        stage_label,
-                        exc,
-                    )
-                else:
-                    raise
-
-    def _try_qclaw_fallback(self, *, original_model: str = "") -> bool:
-        """Apply local QClaw provider (like settings Save with model=openclaw)."""
-        from pa_agent.ai.qclaw_connector import (
-            apply_qclaw_provider_to_settings,
-            is_openclaw_model,
-        )
-        from pa_agent.config.paths import SETTINGS_JSON_PATH
-
-        if not is_openclaw_model(original_model):
-            return False
-        if self._settings is None:
-            return False
-
-        from pa_agent.config.settings import save_settings
-        from pa_agent.util.logging import update_api_key
-
-        err = apply_qclaw_provider_to_settings(self._settings)
-        if err:
-            logger.warning("QClaw auto-fallback unavailable: %s", err)
-            return False
-
-        self._client.update_provider(self._settings.provider)
+        """Call the Codex SDK client without switching providers on failure."""
         try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
-            update_api_key(self._settings.provider.api_key)
-        except Exception as save_exc:  # noqa: BLE001
-            logger.warning("QClaw fallback applied but settings save failed: %s", save_exc)
-
-        logger.info(
-            "QClaw auto-fallback: model=%s base_url=%s",
-            self._settings.provider.model,
-            self._settings.provider.base_url,
-        )
-        return True
-
-    def _try_cursor_fallback(self, *, original_model: str = "") -> bool:
-        """Apply Cursor route via QClaw (like settings Save with model=openclaw_cs)."""
-        from pa_agent.ai.cursor_connector import (
-            apply_cursor_provider_to_settings,
-            is_openclaw_cs_model,
-        )
-        from pa_agent.config.paths import SETTINGS_JSON_PATH
-
-        if not is_openclaw_cs_model(original_model):
-            return False
-        if self._settings is None:
-            return False
-
-        from pa_agent.config.settings import save_settings
-        from pa_agent.util.logging import update_api_key
-
-        err = apply_cursor_provider_to_settings(
-            self._settings,
-            preferred_model=original_model,
-        )
-        if err:
-            logger.warning("Cursor auto-fallback unavailable: %s", err)
-            return False
-
-        self._client.update_provider(self._settings.provider)
-        try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
-            update_api_key(self._settings.provider.api_key)
-        except Exception as save_exc:  # noqa: BLE001
-            logger.warning("Cursor fallback applied but settings save failed: %s", save_exc)
-
-        logger.info(
-            "Cursor auto-fallback: model=%s base_url=%s",
-            self._settings.provider.model,
-            self._settings.provider.base_url,
-        )
-        return True
-
-    def _try_workbuddy_fallback(self, *, original_model: str = "") -> bool:
-        """Apply WorkBuddy provider (like settings Save with model=openclaw_wb)."""
-        from pa_agent.ai.workbuddy_connector import (
-            apply_workbuddy_provider_to_settings,
-            is_openclaw_wb_model,
-        )
-        from pa_agent.config.paths import SETTINGS_JSON_PATH
-
-        if not is_openclaw_wb_model(original_model):
-            return False
-        if self._settings is None:
-            return False
-
-        from pa_agent.config.settings import save_settings
-        from pa_agent.util.logging import update_api_key
-
-        err = apply_workbuddy_provider_to_settings(self._settings)
-        if err:
-            logger.warning("WorkBuddy auto-fallback unavailable: %s", err)
-            return False
-
-        self._client.update_provider(self._settings.provider)
-        try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
-            update_api_key(self._settings.provider.api_key)
-        except Exception as save_exc:  # noqa: BLE001
-            logger.warning("WorkBuddy fallback applied but settings save failed: %s", save_exc)
-
-        logger.info(
-            "WorkBuddy auto-fallback: model=%s base_url=%s",
-            self._settings.provider.model,
-            self._settings.provider.base_url,
-        )
-        return True
+            return self._client.stream_chat(
+                messages,
+                on_reasoning_token=on_reasoning_token,
+                on_content_token=on_content_token,
+                cancel_token=cancel_token,
+                thinking=thinking,
+                reasoning_effort=reasoning_effort,
+            )
+        except Exception as exc:
+            logger.warning("%s Codex SDK call failed: %s", stage_label, exc)
+            raise
 
     @staticmethod
     def _is_network_error(exc: Exception) -> bool:
         """Return True if *exc* is a network/timeout error (SDK, httpx, or OS reset)."""
-        from pa_agent.ai.deepseek_client import CancelledError
-
         if isinstance(exc, CancelledError):
             return False
-
-        try:
-            import openai  # type: ignore[import]
-
-            if isinstance(
-                exc,
-                (
-                    openai.APITimeoutError,
-                    openai.APIConnectionError,
-                    openai.APIStatusError,
-                ),
-            ):
-                return True
-        except ImportError:
-            pass
 
         try:
             import httpx  # type: ignore[import]

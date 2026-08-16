@@ -9,18 +9,21 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from pa_agent.ai.deepseek_client import AIReply, AIUsage, CancelledError
+from pa_agent.ai.model_types import AIReply, AIUsage, CancelledError
 from pa_agent.config.settings import AIProviderSettings
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+_CODEX_PROCESS_LAUNCH_LOCK = threading.Lock()
 _CODEX_AGENT_INSTRUCTIONS = """\
 You are the analysis model embedded in PA Agent, not a coding assistant for this turn.
 Use only the market data and instructions supplied in the user prompt.
@@ -81,6 +84,45 @@ def _error_text(error: Any) -> str:
     if message:
         return str(message)
     return str(error)
+
+
+class _HiddenConsoleSubprocessProxy:
+    """Delegate to subprocess while adding CREATE_NO_WINDOW to Popen calls."""
+
+    def __init__(self, base: Any, *, create_no_window_flag: int) -> None:
+        self._base = base
+        self._create_no_window_flag = int(create_no_window_flag)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def Popen(self, *args: Any, **kwargs: Any) -> Any:
+        existing = int(kwargs.get("creationflags", 0) or 0)
+        kwargs["creationflags"] = existing | self._create_no_window_flag
+        return self._base.Popen(*args, **kwargs)
+
+
+@contextmanager
+def _codex_process_launch_context(*, hide_console_on_windows: bool):
+    """Apply the configured Windows console policy only while Codex starts."""
+
+    create_no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    if not hide_console_on_windows or os.name != "nt" or not create_no_window:
+        yield
+        return
+
+    import openai_codex.client as sdk_client_module
+
+    with _CODEX_PROCESS_LAUNCH_LOCK:
+        original_subprocess = sdk_client_module.subprocess
+        sdk_client_module.subprocess = _HiddenConsoleSubprocessProxy(
+            original_subprocess,
+            create_no_window_flag=create_no_window,
+        )
+        try:
+            yield
+        finally:
+            sdk_client_module.subprocess = original_subprocess
 
 
 class CodexSdkClient:
@@ -148,7 +190,9 @@ class CodexSdkClient:
         watcher: threading.Thread | None = None
         t0 = time.monotonic()
 
-        codex = Codex(CodexConfig(cwd=cwd))
+        hide_console = self._settings.codex_process.hide_console_on_windows
+        with _codex_process_launch_context(hide_console_on_windows=hide_console):
+            codex = Codex(CodexConfig(cwd=cwd))
         turn: Any = None
         try:
             thread = codex.thread_start(

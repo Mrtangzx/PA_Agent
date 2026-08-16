@@ -7,7 +7,6 @@ from datetime import timedelta
 from typing import Any
 
 from pa_agent.data.ashare_common import (
-    PRESET_SYMBOLS as _PRESET_SYMBOLS,
     ashare_after_close_today as _ashare_after_close_today,
     ashare_head_bar_live as _ashare_head_bar_live,
     ashare_session_open as _ashare_session_open,
@@ -16,8 +15,8 @@ from pa_agent.data.ashare_common import (
     ensure_today_closed_daily_bar,
     ensure_today_forming_daily_bar,
     index_symbol_for_api as _index_symbol_for_api,
+    is_a_share_stock_symbol,
     is_index_symbol,
-    merge_ohlcv as _merge_ohlcv,
     normalize_ashare_symbol,
     resample_rows_to_4h as _resample_rows_to_4h,
     row_time_to_ts_ms as _row_time_to_ts_ms,
@@ -53,8 +52,6 @@ _PRESET_SYMBOLS: tuple[str, ...] = (
     "000858",
     "300750",
     "601318",
-    "sh000300",
-    "sz399006",
 )
 
 _SUPPORTED_TIMEFRAMES: tuple[str, ...] = (
@@ -138,9 +135,12 @@ class EastMoneySource(DataSource):
                 f"Unsupported timeframe: {timeframe!r}. "
                 f"Use one of {list(_SUPPORTED_TIMEFRAMES)}"
             )
+        if not is_a_share_stock_symbol(symbol):
+            raise ValueError(
+                "当前仅支持A股股票，请输入6位股票代码（如600519）；"
+                "指数、基金及其他证券类型不开放"
+            )
         code = normalize_ashare_symbol(symbol)
-        if not code:
-            raise ValueError("A股代码无效，请输入 6 位数字（如 600519）或指数 sh000300")
         if code != self._symbol or timeframe != self._timeframe:
             self._snap_cache_bars = []
             self._snap_cache_n = 0

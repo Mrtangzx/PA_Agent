@@ -30,12 +30,17 @@ from pa_agent.trading.broker_models import (
     BrokerQuote,
     BrokerSnapshot,
     ConnectionState,
+    PrefillClearReceipt,
     PrefillReceipt,
     ReconciliationResult,
     ThsBinding,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ThsAdapterIncompatibleError(RuntimeError):
+    """The verified TongHuaShun control/table contract no longer matches."""
 
 
 def _now() -> str:
@@ -238,9 +243,11 @@ class ThsUiBackend(Protocol):
     def launch_clients(self, install_path: str = "") -> list[str]: ...
 
     def discover(self) -> dict[str, Any]: ...
-    def read_snapshot_tables(self) -> dict[str, str]: ...
+    def read_snapshot_tables(self) -> dict[str, Any]: ...
     def visible_texts(self) -> list[str]: ...
     def prefill_fields(self, order: AuthorizedOrder) -> dict[str, Any]: ...
+    def clear_prefill_fields(self) -> dict[str, Any]: ...
+    def clear_prefill_if_matches(self, order: AuthorizedOrder) -> dict[str, Any]: ...
 
 
 class ThsBrokerAdapter:
@@ -262,6 +269,7 @@ class ThsBrokerAdapter:
             checked_at=_now(),
         )
         self._last_snapshot: BrokerSnapshot | None = None
+        self._adapter_incompatible_reason = ""
 
     @property
     def connection(self) -> ConnectionState:
@@ -300,11 +308,15 @@ class ThsBrokerAdapter:
             message = "已连接同花顺；账户快照通过后才允许风控授权"
         install_path = str(found.get("install_path") or "")
         version = str(found.get("client_version") or "")
-        detected_fingerprint = account_fingerprint(
-            install_path=install_path,
-            client_version=version,
-            broker_name=detected_broker,
-            masked_account=detected_account,
+        detected_fingerprint = (
+            account_fingerprint(
+                install_path=install_path,
+                client_version=version,
+                broker_name=detected_broker,
+                masked_account=detected_account,
+            )
+            if detected_broker and detected_account
+            else ""
         )
         if (
             status is BrokerConnectionStatus.CONNECTED_READ_ONLY
@@ -315,6 +327,18 @@ class ThsBrokerAdapter:
                 message = "当前同花顺客户端与已确认账户指纹不一致"
             elif self.binding.allow_prefill and not self.binding.read_only:
                 status = BrokerConnectionStatus.CONNECTED
+        if (
+            status in {
+                BrokerConnectionStatus.CONNECTED_READ_ONLY,
+                BrokerConnectionStatus.CONNECTED,
+            }
+            and self._adapter_incompatible_reason
+        ):
+            status = BrokerConnectionStatus.ADAPTER_INCOMPATIBLE
+            message = (
+                "同花顺控件或表格结构已变化，需要重新校准适配器："
+                + self._adapter_incompatible_reason
+            )
         self._connection = ConnectionState(
             status=status,
             message=message,
@@ -329,6 +353,18 @@ class ThsBrokerAdapter:
             detected_masked_account=detected_account,
             checked_at=_now(),
         )
+        return self._connection
+
+    def _mark_adapter_incompatible(self, reason: str) -> ConnectionState:
+        self._adapter_incompatible_reason = str(reason).strip() or "unknown_contract_change"
+        self._connection = self._connection.model_copy(update={
+            "status": BrokerConnectionStatus.ADAPTER_INCOMPATIBLE,
+            "message": (
+                "同花顺控件或表格结构已变化，需要重新校准适配器："
+                + self._adapter_incompatible_reason
+            ),
+            "checked_at": _now(),
+        })
         return self._connection
 
     def launch_clients(self, *, install_path: str = "") -> ConnectionState:
@@ -393,6 +429,16 @@ class ThsBrokerAdapter:
                     warnings.append("cash_flow_page_reader_unavailable")
                 else:
                     tables.update(reader(captured_at=captured_at))
+        except ThsAdapterIncompatibleError as exc:
+            logger.warning("同花顺适配器结构不兼容: %s", exc)
+            state = self._mark_adapter_incompatible(str(exc))
+            return BrokerSnapshot(
+                connection=state,
+                account_fingerprint=state.account_fingerprint,
+                captured_at=_now(),
+                complete=False,
+                warnings=[state.message],
+            )
         except Exception as exc:
             logger.warning("同花顺只读快照失败: %s", exc)
             tables = {}
@@ -401,9 +447,36 @@ class ThsBrokerAdapter:
         current_grid = tables.get("current_grid", "")
         if not positions_text and _is_position_grid(current_grid):
             positions_text = current_grid
+        orders_text = str(tables.get("orders", ""))
+        fills_text = str(tables.get("fills", ""))
         positions = _parse_positions(positions_text, warnings)
-        orders = _parse_orders(tables.get("orders", ""), warnings)
-        fills = _parse_fills(tables.get("fills", ""), warnings)
+        orders = _parse_orders(orders_text, warnings, captured_at=captured_at)
+        fills = _parse_fills(fills_text, warnings, captured_at=captured_at)
+        positions_complete = all((
+            bool(tables.get("positions_read_complete", True)),
+            _is_position_grid(positions_text),
+            "持仓表存在但无法按已知列名解析" not in warnings,
+            "positions_row_incomplete" not in warnings,
+        ))
+        orders_complete = all((
+            bool(tables.get("orders_read_complete", True)),
+            _is_order_grid(orders_text),
+            "委托表存在但无法按已知列名解析" not in warnings,
+            "orders_row_incomplete" not in warnings,
+        ))
+        fills_complete = all((
+            bool(tables.get("fills_read_complete", True)),
+            _is_fill_grid(fills_text),
+            "成交表存在但无法按已知列名解析" not in warnings,
+            "fills_row_incomplete" not in warnings,
+        ))
+        for table_name, table_complete in (
+            ("positions", positions_complete),
+            ("orders", orders_complete),
+            ("fills", fills_complete),
+        ):
+            if not table_complete:
+                warnings.append(f"{table_name}_table_not_verified")
         cash_flow_text = tables.get("cash_flows", "")
         cash_flows = _parse_cash_flows(cash_flow_text, warnings)
         cash_flow_range_start = str(
@@ -422,10 +495,37 @@ class ThsBrokerAdapter:
             warnings.append("cash_flow_history_not_verified")
         funds = _parse_funds(tables.get("funds", ""), warnings)
         quote = _parse_quote(tables.get("quote", ""), warnings)
-        complete = all(
+        # Re-read identity after navigating all fact-table pages. A logout,
+        # account switch or modal appearing mid-sync invalidates every value
+        # collected before it.
+        final_state = self.connect()
+        if (
+            not final_state.usable
+            or final_state.account_fingerprint != state.account_fingerprint
+        ):
+            return BrokerSnapshot(
+                connection=final_state,
+                account_fingerprint=final_state.account_fingerprint,
+                captured_at=_now(),
+                complete=False,
+                warnings=list(dict.fromkeys([
+                    *warnings,
+                    "account_or_client_state_changed_during_snapshot",
+                    final_state.message,
+                ])),
+            )
+        state = final_state
+        funds_complete = all(
             key in funds and funds[key] is not None
             for key in ("total_equity", "available_cash", "position_value")
-        ) and bool(self.binding.confirmed)
+        )
+        complete = all((
+            funds_complete,
+            bool(self.binding.confirmed),
+            positions_complete,
+            orders_complete,
+            fills_complete,
+        ))
         if not complete:
             warnings.append("账户资金或账户绑定尚未完成，实盘授权保持关闭")
         snapshot = BrokerSnapshot(
@@ -438,6 +538,9 @@ class ThsBrokerAdapter:
             positions=positions,
             orders=orders,
             fills=fills,
+            positions_complete=positions_complete,
+            orders_complete=orders_complete,
+            fills_complete=fills_complete,
             cash_flows=cash_flows,
             cash_flow_complete=cash_flow_complete,
             cash_flow_range_start=cash_flow_range_start,
@@ -451,6 +554,15 @@ class ThsBrokerAdapter:
         return snapshot
 
     def prefill(self, order: AuthorizedOrder) -> PrefillReceipt:
+        from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+        if not is_a_share_stock_symbol(order.symbol):
+            return PrefillReceipt(
+                status="blocked",
+                message="当前交易范围仅限A股股票，非A股或指数不得预填",
+                created_at=_now(),
+                final_confirmation_clicked=False,
+            )
         state = self.connect()
         if state.status is not BrokerConnectionStatus.CONNECTED:
             return PrefillReceipt(
@@ -469,6 +581,15 @@ class ThsBrokerAdapter:
             )
         try:
             result = self.backend.prefill_fields(order)
+        except ThsAdapterIncompatibleError as exc:
+            logger.warning("同花顺预填控件结构不兼容: %s", exc)
+            self._mark_adapter_incompatible(str(exc))
+            return PrefillReceipt(
+                status="blocked",
+                message=self._connection.message,
+                created_at=_now(),
+                final_confirmation_clicked=False,
+            )
         except Exception as exc:
             logger.exception("同花顺委托预填失败")
             return PrefillReceipt(
@@ -483,15 +604,85 @@ class ThsBrokerAdapter:
             "quantity": order.quantity,
             "name": order.name,
         }
-        if any(str(verified.get(key, "")) != str(value) for key, value in expected.items()):
+        if not _prefill_fields_match(verified, expected):
+            cleanup = self._clear_failed_prefill()
+            cleanup_status = str(cleanup.get("status") or "not_cleared")
+            cleanup_message = str(cleanup.get("message") or "")
             return PrefillReceipt(
-                status="failed", message="预填后回读字段不一致，输入内容已清空",
-                verified_fields=verified, created_at=_now(), final_confirmation_clicked=False,
+                status="failed",
+                message=(
+                    "预填后回读字段不一致；已清空本次代码、价格和数量。"
+                    if cleanup_status == "cleared"
+                    else "预填后回读字段不一致，且无法证明输入字段已经清空；"
+                    "请立即在同花顺人工核查，系统已停止预填。"
+                ) + (f" {cleanup_message}" if cleanup_message else ""),
+                verified_fields={
+                    **verified,
+                    "cleanup_status": cleanup_status,
+                    "cleanup_message": cleanup_message,
+                },
+                created_at=_now(), final_confirmation_clicked=False,
             )
         return PrefillReceipt(
             status="awaiting_user_confirmation",
             message="委托字段已回读校验，请在同花顺中人工确认",
             verified_fields=verified,
+            created_at=_now(),
+            final_confirmation_clicked=False,
+        )
+
+    def _clear_failed_prefill(self) -> dict[str, Any]:
+        """Clear only the three labeled editable fields after failed readback."""
+        cleaner = getattr(self.backend, "clear_prefill_fields", None)
+        if cleaner is None:
+            return {
+                "status": "not_cleared",
+                "message": "当前适配器不支持失败预填清空回读",
+            }
+        try:
+            return dict(cleaner() or {})
+        except ThsAdapterIncompatibleError as exc:
+            self._mark_adapter_incompatible(str(exc))
+            return {"status": "not_cleared", "message": self._connection.message}
+        except Exception as exc:  # noqa: BLE001 - uncertainty remains visible
+            logger.warning("同花顺失败预填清空未完成: %s", exc)
+            return {"status": "not_cleared", "message": str(exc)}
+
+    def clear_prefill_if_matches(self, order: AuthorizedOrder) -> PrefillClearReceipt:
+        """Clear fields only after exact independent readback of this order."""
+        state = self.connect()
+        if state.status is not BrokerConnectionStatus.CONNECTED:
+            return PrefillClearReceipt(
+                status="not_cleared",
+                message=f"同花顺状态不允许安全清空：{state.status.value}",
+                created_at=_now(),
+            )
+        if order.account_fingerprint != self.binding.account_fingerprint:
+            return PrefillClearReceipt(
+                status="not_cleared",
+                message="账户指纹不一致，未触碰同花顺输入框",
+                created_at=_now(),
+            )
+        try:
+            result = self.backend.clear_prefill_if_matches(order)
+        except ThsAdapterIncompatibleError as exc:
+            self._mark_adapter_incompatible(str(exc))
+            return PrefillClearReceipt(
+                status="not_cleared",
+                message=self._connection.message,
+                created_at=_now(),
+            )
+        except Exception as exc:  # noqa: BLE001 - UI uncertainty fails closed
+            logger.warning("同花顺预填安全清空未执行: %s", exc)
+            return PrefillClearReceipt(
+                status="not_cleared",
+                message=str(exc),
+                created_at=_now(),
+            )
+        return PrefillClearReceipt(
+            status=str(result.get("status") or "not_cleared"),
+            message=str(result.get("message") or ""),
+            verified_fields=dict(result.get("verified_fields") or {}),
             created_at=_now(),
             final_confirmation_clicked=False,
         )
@@ -504,15 +695,34 @@ class ThsBrokerAdapter:
         time_window_seconds: int = 60,
     ) -> ReconciliationResult:
         current = snapshot or self.snapshot()
-        candidates = [
-            item for item in current.orders
-            if _order_matches(item, order, time_window_seconds=time_window_seconds)
-        ]
-        if len(candidates) != 1:
+        safety_gaps = _reconciliation_snapshot_gaps(
+            current,
+            order=order,
+            binding=self.binding,
+            max_age_seconds=self.binding.max_quote_age_seconds,
+        )
+        if safety_gaps:
             return ReconciliationResult(
                 status="reconciliation_required",
                 plan_id=order.plan_id,
-                candidates=[item.broker_order_id for item in candidates],
+                message="同花顺对账快照不可信，需要重新同步或人工核对："
+                + ", ".join(safety_gaps),
+            )
+        candidates = matching_broker_orders(
+            current,
+            order,
+            time_window_seconds=time_window_seconds,
+        )
+        candidate_ids = [item.broker_order_id for item in candidates]
+        if (
+            len(candidates) != 1
+            or not candidate_ids[0]
+            or len(set(candidate_ids)) != len(candidate_ids)
+        ):
+            return ReconciliationResult(
+                status="reconciliation_required",
+                plan_id=order.plan_id,
+                candidates=candidate_ids,
                 message="没有唯一匹配的同花顺委托，需要用户人工关联",
             )
         broker_order = candidates[0]
@@ -520,6 +730,13 @@ class ThsBrokerAdapter:
             fill for fill in current.fills
             if fill.broker_order_id and fill.broker_order_id == broker_order.broker_order_id
         ]
+        if any(not fill.broker_fill_id for fill in fills):
+            return ReconciliationResult(
+                status="reconciliation_required",
+                plan_id=order.plan_id,
+                candidates=[broker_order.broker_order_id],
+                message="成交记录缺少唯一成交编号，需要用户人工核对",
+            )
         return ReconciliationResult(
             status="matched",
             plan_id=order.plan_id,
@@ -789,9 +1006,13 @@ class Win32ThsBackend:
         win32gui.EnumChildWindows(root, callback, None)
         return controls
 
-    def read_snapshot_tables(self) -> dict[str, str]:
+    def read_snapshot_tables(self) -> dict[str, Any]:
         """Read pages through their own copy command; failures remain incomplete."""
-        tables: dict[str, str] = {}
+        root = self._require_trading_window()
+        modal_texts = self._visible_blocking_modal_texts(root)
+        if modal_texts:
+            raise RuntimeError("同花顺存在模态窗口，禁止读取账户事实表")
+        tables: dict[str, Any] = {}
         controls = self._control_snapshot()
         control_funds = _funds_text_from_controls(controls)
         if control_funds:
@@ -800,6 +1021,14 @@ class Win32ThsBackend:
         tables["quote"] = "\n".join(texts)
         if "funds" not in tables:
             tables["funds"] = ""
+        for key, labels, verifier in (
+            ("positions", ("持仓",), _is_position_grid),
+            ("orders", ("当日委托",), _is_order_grid),
+            ("fills", ("当日成交",), _is_fill_grid),
+        ):
+            text = self._copy_named_grid(labels, verifier=verifier)
+            tables[key] = text
+            tables[f"{key}_read_complete"] = bool(text and verifier(text))
         return tables
 
     def read_current_cash_flow_page(self, *, captured_at: str) -> dict[str, Any]:
@@ -821,10 +1050,10 @@ class Win32ThsBackend:
             if item.get("visible") and item.get("class_name") == "CVirtualGridCtrl"
         ]
         if len(grids) != 1:
-            raise RuntimeError("未能唯一识别当前资金流水表格")
+            raise ThsAdapterIncompatibleError("未能唯一识别当前资金流水表格")
         text = self._copy_existing_grid(int(grids[0]["hwnd"]))
         if not _is_cash_flow_grid(text):
-            raise RuntimeError("当前表格列名不是可识别的资金流水")
+            raise ThsAdapterIncompatibleError("当前表格列名不是可识别的资金流水")
         start, end = _cash_flow_query_range(controls, captured_at=captured_at)
         if not start or not end:
             raise RuntimeError("未能回读资金流水查询起止日期")
@@ -885,7 +1114,9 @@ class Win32ThsBackend:
         mapping = self._labeled_edit_controls()
         required = {"symbol", "price", "quantity"}
         if not required.issubset(mapping):
-            raise RuntimeError("未能按标签唯一识别代码、价格和数量输入框；拒绝预填")
+            raise ThsAdapterIncompatibleError(
+                "未能按标签唯一识别代码、价格和数量输入框；拒绝预填"
+            )
         entered = {
             "symbol": order.symbol,
             "price": f"{order.price:g}",
@@ -919,6 +1150,80 @@ class Win32ThsBackend:
                 win32gui.SendMessage(hwnd, win32con.WM_SETTEXT, 0, "")
             raise
 
+    def clear_prefill_fields(self) -> dict[str, Any]:
+        """Clear the three labeled editable fields and independently read them back."""
+        import win32con
+        import win32gui
+
+        root = self._require_trading_window()
+        if self._visible_blocking_modal_texts(root):
+            raise RuntimeError("同花顺存在模态窗口，无法安全清空失败预填")
+        mapping = self._labeled_edit_controls()
+        required = {"symbol", "price", "quantity"}
+        if not required.issubset(mapping):
+            raise ThsAdapterIncompatibleError(
+                "无法唯一识别失败预填字段，未执行清空"
+            )
+        for key in ("symbol", "price", "quantity"):
+            win32gui.SendMessage(mapping[key], win32con.WM_SETTEXT, 0, "")
+        cleared = {
+            key: win32gui.GetWindowText(mapping[key]).strip() for key in required
+        }
+        if any(cleared.values()):
+            raise RuntimeError("失败预填字段清空后回读非空，请人工核查同花顺")
+        return {
+            "status": "cleared",
+            "message": "失败预填的代码、价格和数量已清空并回读为空",
+            "verified_fields": cleared,
+        }
+
+    def clear_prefill_if_matches(self, order: AuthorizedOrder) -> dict[str, Any]:
+        """Re-read exact prefill controls, then clear only editable fields."""
+        import win32con
+        import win32gui
+
+        root = self._require_trading_window()
+        if self._visible_blocking_modal_texts(root):
+            raise RuntimeError("同花顺存在模态窗口，未触碰预填字段")
+        mapping = self._labeled_edit_controls()
+        required = {"symbol", "price", "quantity"}
+        if not required.issubset(mapping):
+            raise ThsAdapterIncompatibleError("无法唯一识别预填字段，未执行清空")
+        readback = {
+            key: win32gui.GetWindowText(mapping[key]).strip() for key in required
+        }
+        visible = self.visible_texts()
+        verified = {
+            "symbol": readback["symbol"],
+            "direction": order.direction,
+            "price": _number(readback["price"]),
+            "quantity": _number(readback["quantity"]),
+            "name": order.name if any(
+                order.name == text or order.name in text for text in visible
+            ) else "",
+        }
+        expected = {
+            "symbol": order.symbol,
+            "direction": order.direction,
+            "price": float(order.price),
+            "quantity": float(order.quantity),
+            "name": order.name,
+        }
+        if any(str(verified.get(key, "")) != str(value) for key, value in expected.items()):
+            raise RuntimeError("当前字段不再与原计划完全一致，未执行清空")
+        for key in ("symbol", "price", "quantity"):
+            win32gui.SendMessage(mapping[key], win32con.WM_SETTEXT, 0, "")
+        cleared = {
+            key: win32gui.GetWindowText(mapping[key]).strip() for key in required
+        }
+        if any(cleared.values()):
+            raise RuntimeError("字段清空后回读非空，请人工核查同花顺")
+        return {
+            "status": "cleared",
+            "message": "重大风险触发，已在完全匹配后清空本次预填字段",
+            "verified_fields": verified,
+        }
+
     def _require_trading_window(self) -> int:
         if not self._trading_window:
             self.discover()
@@ -926,50 +1231,49 @@ class Win32ThsBackend:
             raise RuntimeError("同花顺交易窗口不可用")
         return self._trading_window
 
-    def _copy_named_grid(self, labels: tuple[str, ...]) -> str:
-        import win32clipboard
+    def _copy_named_grid(
+        self,
+        labels: tuple[str, ...],
+        *,
+        verifier,
+    ) -> str:
         import win32con
         import win32gui
 
         root = self._require_trading_window()
+        if self._visible_blocking_modal_texts(root):
+            raise RuntimeError("同花顺存在模态窗口，禁止切换只读账户页面")
         navigation: list[int] = []
-        grids: list[tuple[int, int]] = []
 
         def callback(hwnd: int, _extra: object) -> bool:
             if not win32gui.IsWindowVisible(hwnd):
                 return True
             text = win32gui.GetWindowText(hwnd).strip()
             class_name = win32gui.GetClassName(hwnd)
-            if text in labels and class_name in {"Button", "Static"}:
+            if text in labels and class_name == "Button" and win32gui.IsWindowEnabled(hwnd):
                 navigation.append(hwnd)
-            if class_name == "CVirtualGridCtrl":
-                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-                grids.append((max(0, right - left) * max(0, bottom - top), hwnd))
             return True
 
         win32gui.EnumChildWindows(root, callback, None)
-        if not navigation or not grids:
-            return ""
-        nav = navigation[0]
-        if win32gui.GetClassName(nav) != "Button":
-            return ""  # Static labels are not invoked because that can hit an unknown action.
-        win32gui.SendMessage(nav, win32con.BM_CLICK, 0, 0)
+        if len(navigation) != 1:
+            raise ThsAdapterIncompatibleError(
+                f"未能唯一识别只读导航按钮：{'/'.join(labels)}"
+            )
+        win32gui.SendMessage(navigation[0], win32con.BM_CLICK, 0, 0)
         time.sleep(0.25)
-        grid = max(grids)[1]
-        win32gui.SetForegroundWindow(root)
-        win32gui.SetFocus(grid)
-        self._press_ctrl_key(ord("A"))
-        self._press_ctrl_key(ord("C"))
-        time.sleep(0.15)
-        try:
-            win32clipboard.OpenClipboard()
-            value = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-        except Exception:
-            return ""
-        finally:
-            with suppress(Exception):
-                win32clipboard.CloseClipboard()
-        return str(value).strip()
+        if self._visible_blocking_modal_texts(root):
+            raise RuntimeError("切换只读页面后出现模态窗口，停止账户同步")
+        controls = self._control_snapshot()
+        grids = [
+            item for item in controls
+            if item.get("visible") and item.get("class_name") == "CVirtualGridCtrl"
+        ]
+        if len(grids) != 1:
+            raise ThsAdapterIncompatibleError("未能唯一识别当前只读结果表格")
+        value = self._copy_existing_grid(int(grids[0]["hwnd"]))
+        if not verifier(value):
+            raise ThsAdapterIncompatibleError("当前只读结果表格列名与目标页面不一致")
+        return value
 
     def _labeled_edit_controls(self) -> dict[str, int]:
         import win32gui
@@ -1074,9 +1378,51 @@ def _number(value: str) -> float | None:
     return float(match.group()) if match else None
 
 
+def _broker_timestamp(
+    date_value: str,
+    time_value: str,
+    *,
+    captured_at: str | None,
+) -> str:
+    """Normalize broker table date/time without inventing an unknown trading day."""
+    raw_date = str(date_value or "").strip()
+    raw_time = str(time_value or "").strip()
+    combined = " ".join(part for part in (raw_date, raw_time) if part)
+    if not combined:
+        return ""
+    normalized = combined.replace("/", "-")
+    for candidate in (combined, raw_time, normalized):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None and captured_at:
+            try:
+                captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+                parsed = parsed.replace(tzinfo=captured.tzinfo)
+            except ValueError:
+                pass
+        return parsed.isoformat()
+    time_match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", raw_time)
+    if not time_match or not captured_at:
+        return ""
+    try:
+        captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        return captured.replace(
+            hour=int(time_match.group(1)),
+            minute=int(time_match.group(2)),
+            second=int(time_match.group(3) or 0),
+            microsecond=0,
+        ).isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
 def _parse_positions(text: str, warnings: list[str]) -> list[BrokerPosition]:
     result: list[BrokerPosition] = []
     for row in _rows(text):
+        if _row_is_empty_marker(row):
+            continue
         symbol = _value(row, "证券代码", "股票代码", "代码")
         qty = _number(_value(row, "股票余额", "证券数量", "持仓数量", "数量"))
         sellable = _number(_value(row, "可用余额", "可卖数量", "可用数量"))
@@ -1089,7 +1435,11 @@ def _parse_positions(text: str, warnings: list[str]) -> list[BrokerPosition]:
                 quantity=int(qty), sellable_quantity=int(sellable), cost_price=cost,
                 last_price=last, market_value=market,
             ))
-    if text and not result:
+        elif any(str(value or "").strip() for value in row.values()):
+            warnings.append("positions_row_incomplete")
+    if text and not result and (
+        _table_has_records(text) or not _is_position_grid(text)
+    ):
         warnings.append("持仓表存在但无法按已知列名解析")
     return result
 
@@ -1107,6 +1457,50 @@ def _is_position_grid(text: str) -> bool:
         and bool(headers & {"市价", "当前价", "最新价"})
         and bool(headers & {"市值", "证券市值"})
     )
+
+
+def _is_order_grid(text: str) -> bool:
+    headers = _table_headers(text)
+    return (
+        bool(headers & {"证券代码", "股票代码", "代码"})
+        and bool(headers & {"买卖标志", "操作", "方向"})
+        and bool(headers & {"委托价格", "价格"})
+        and bool(headers & {"委托数量", "数量"})
+        and bool(headers & {"委托状态", "状态", "备注"})
+    )
+
+
+def _is_fill_grid(text: str) -> bool:
+    headers = _table_headers(text)
+    return (
+        bool(headers & {"证券代码", "股票代码", "代码"})
+        and bool(headers & {"买卖标志", "操作", "方向"})
+        and bool(headers & {"成交价格", "成交均价", "价格"})
+        and bool(headers & {"成交数量", "数量"})
+        and bool(headers & {"成交时间", "时间"})
+    )
+
+
+def _table_headers(text: str) -> set[str]:
+    first_line = next((line for line in text.splitlines() if line.strip()), "")
+    return {item.replace(" ", "").strip() for item in first_line.split("\t")}
+
+
+def _table_has_records(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return any(
+        line not in {"无记录", "暂无数据", "无数据", "暂无记录"}
+        for line in lines[1:]
+    )
+
+
+def _row_is_empty_marker(row: dict[str, str]) -> bool:
+    values = {
+        str(value or "").replace(" ", "").strip()
+        for value in row.values()
+        if str(value or "").strip()
+    }
+    return bool(values) and values.issubset({"无记录", "暂无数据", "无数据", "暂无记录"})
 
 
 def _is_cash_flow_grid(text: str) -> bool:
@@ -1149,42 +1543,74 @@ def _cash_flow_query_range(
     return start, end
 
 
-def _parse_orders(text: str, warnings: list[str]) -> list[BrokerOrder]:
+def _parse_orders(
+    text: str,
+    warnings: list[str],
+    *,
+    captured_at: str | None = None,
+) -> list[BrokerOrder]:
     result: list[BrokerOrder] = []
     for row in _rows(text):
+        if _row_is_empty_marker(row):
+            continue
         symbol = _value(row, "证券代码", "股票代码", "代码")
         price = _number(_value(row, "委托价格", "价格"))
         qty = _number(_value(row, "委托数量", "数量"))
         filled = _number(_value(row, "成交数量", "已成数量")) or 0
-        if symbol and price and qty:
+        submitted_at = _broker_timestamp(
+            _value(row, "委托日期", "日期"),
+            _value(row, "委托时间", "时间"),
+            captured_at=captured_at,
+        )
+        if symbol and price and qty and submitted_at:
             result.append(BrokerOrder(
                 broker_order_id=_value(row, "合同编号", "委托编号", "合同序号"),
                 symbol=symbol.zfill(6), direction=_normalize_direction(_value(row, "买卖标志", "操作", "方向")),
                 price=price, quantity=int(qty), filled_quantity=int(filled),
                 status=_value(row, "备注", "委托状态", "状态"),
-                submitted_at=_value(row, "委托时间", "时间") or _now(),
+                submitted_at=submitted_at,
             ))
-    if text and not result:
+        elif any(str(value or "").strip() for value in row.values()):
+            warnings.append("orders_row_incomplete")
+    if text and not result and (
+        _table_has_records(text) or not _is_order_grid(text)
+    ):
         warnings.append("委托表存在但无法按已知列名解析")
     return result
 
 
-def _parse_fills(text: str, warnings: list[str]) -> list[BrokerFill]:
+def _parse_fills(
+    text: str,
+    warnings: list[str],
+    *,
+    captured_at: str | None = None,
+) -> list[BrokerFill]:
     result: list[BrokerFill] = []
     for row in _rows(text):
+        if _row_is_empty_marker(row):
+            continue
         symbol = _value(row, "证券代码", "股票代码", "代码")
         price = _number(_value(row, "成交价格", "成交均价", "价格"))
         qty = _number(_value(row, "成交数量", "数量"))
-        if symbol and price and qty:
+        filled_at = _broker_timestamp(
+            _value(row, "成交日期", "日期"),
+            _value(row, "成交时间", "时间"),
+            captured_at=captured_at,
+        )
+        if symbol and price and qty and filled_at:
             result.append(BrokerFill(
                 broker_fill_id=_value(row, "成交编号", "成交序号"),
                 broker_order_id=_value(row, "合同编号", "委托编号", "合同序号"),
                 symbol=symbol.zfill(6), direction=_normalize_direction(_value(row, "买卖标志", "操作", "方向")),
                 price=price, quantity=int(qty),
                 fees=_number(_value(row, "费用", "手续费")) or 0,
-                filled_at=_value(row, "成交时间", "时间") or _now(),
+                filled_at=filled_at,
             ))
-    if text and not result:
+        elif any(str(value or "").strip() for value in row.values()):
+            warnings.append("fills_row_incomplete")
+    if text and not result and (
+        _table_has_records(text) or not _is_fill_grid(text)
+    ):
         warnings.append("成交表存在但无法按已知列名解析")
     return result
 
@@ -1251,14 +1677,160 @@ def _parse_quote(text: str, warnings: list[str]) -> BrokerQuote | None:
     price_match = re.search(r"(?:最新价|现价)\s*[:：]?\s*(\d+(?:\.\d+)?)", text)
     if not symbol_match or not price_match:
         return None
-    return BrokerQuote(
-        symbol=symbol_match.group(1), last_price=float(price_match.group(1)), captured_at=_now()
+    symbol = symbol_match.group(1)
+    name_match = re.search(
+        rf"{re.escape(symbol)}\s+([^\s|｜:：]{{2,20}})\s+(?:最新价|现价)",
+        text,
     )
+    if name_match is None:
+        name_match = re.search(
+            rf"([^\s|｜:：]{{2,20}})\s+{re.escape(symbol)}\s+(?:最新价|现价)",
+            text,
+        )
+    name = name_match.group(1).strip() if name_match else ""
+    if name.replace(" ", "") in {
+        "证券代码", "股票代码", "代码", "证券名称", "股票名称", "名称"
+    }:
+        name = ""
+    if not name:
+        warnings.append("quote_security_name_unavailable")
+    upper_limit = _labeled_number(
+        text, ("涨停价", "涨停价格", "涨停")
+    )
+    lower_limit = _labeled_number(
+        text, ("跌停价", "跌停价格", "跌停")
+    )
+    normalized = text.replace(" ", "")
+    suspended = any(marker in normalized for marker in ("交易状态:停牌", "交易状态：停牌", "状态:停牌", "状态：停牌"))
+    active_state = any(
+        marker in normalized
+        for marker in (
+            "交易状态:正常", "交易状态：正常", "交易状态:交易中",
+            "交易状态：交易中", "交易状态:集合竞价", "交易状态：集合竞价",
+            "交易状态:已收盘", "交易状态：已收盘",
+        )
+    )
+    execution_state_verified = bool(
+        upper_limit is not None
+        and lower_limit is not None
+        and (suspended or active_state)
+    )
+    if not execution_state_verified:
+        warnings.append("quote_execution_state_unverified")
+    last_price = float(price_match.group(1))
+    limit_locked = bool(
+        execution_state_verified
+        and not suspended
+        and (
+            abs(last_price - float(upper_limit)) <= 1e-8
+            or abs(last_price - float(lower_limit)) <= 1e-8
+        )
+    )
+    return BrokerQuote(
+        symbol=symbol,
+        name=name,
+        last_price=last_price,
+        upper_limit=upper_limit,
+        lower_limit=lower_limit,
+        suspended=suspended,
+        limit_locked=limit_locked,
+        execution_state_verified=execution_state_verified,
+        captured_at=_now(),
+    )
+
+
+def _labeled_number(text: str, labels: tuple[str, ...]) -> float | None:
+    for label in labels:
+        match = re.search(
+            rf"{re.escape(label)}\s*[:：]?\s*(\d+(?:\.\d+)?)",
+            text,
+        )
+        if match:
+            return float(match.group(1))
+    return None
 
 
 def _normalize_direction(value: str) -> str:
     value = value.strip().casefold()
     return "buy" if "买" in value or value == "buy" else "sell" if "卖" in value or value == "sell" else value
+
+
+def _prefill_fields_match(
+    verified: dict[str, Any], expected: dict[str, Any]
+) -> bool:
+    """Compare canonical order fields without string-format false mismatches."""
+    if str(verified.get("symbol") or "").zfill(6) != str(expected["symbol"]).zfill(6):
+        return False
+    if str(verified.get("direction") or "").casefold() != str(
+        expected["direction"]
+    ).casefold():
+        return False
+    if str(verified.get("name") or "").strip() != str(expected["name"]).strip():
+        return False
+    try:
+        return (
+            abs(float(verified.get("price")) - float(expected["price"])) <= 1e-8
+            and int(float(verified.get("quantity"))) == int(expected["quantity"])
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _reconciliation_snapshot_gaps(
+    snapshot: BrokerSnapshot,
+    *,
+    order: AuthorizedOrder,
+    binding: ThsBinding,
+    max_age_seconds: int,
+) -> list[str]:
+    gaps = broker_fact_snapshot_gaps(
+        snapshot, binding=binding, max_age_seconds=max_age_seconds
+    )
+    expected_account = binding.account_fingerprint
+    if order.account_fingerprint != expected_account:
+        gaps.append("order_account_fingerprint_mismatch")
+    return list(dict.fromkeys(gaps))
+
+
+def broker_fact_snapshot_gaps(
+    snapshot: BrokerSnapshot,
+    *,
+    binding: ThsBinding,
+    max_age_seconds: int | None = None,
+) -> list[str]:
+    """Return reasons a snapshot cannot mutate broker execution state."""
+    gaps: list[str] = []
+    if snapshot.connection.status not in {
+        BrokerConnectionStatus.CONNECTED,
+        BrokerConnectionStatus.CONNECTED_READ_ONLY,
+    }:
+        gaps.append(f"broker_status_{snapshot.connection.status.value}")
+    if not binding.confirmed or not binding.account_fingerprint:
+        gaps.append("account_binding_unconfirmed")
+    expected_account = binding.account_fingerprint
+    if (
+        snapshot.account_fingerprint != expected_account
+        or snapshot.connection.account_fingerprint != expected_account
+    ):
+        gaps.append("account_fingerprint_mismatch")
+    if not snapshot.orders_complete:
+        gaps.append("orders_table_incomplete")
+    if not snapshot.fills_complete:
+        gaps.append("fills_table_incomplete")
+    try:
+        captured = datetime.fromisoformat(snapshot.captured_at.replace("Z", "+00:00"))
+        if captured.tzinfo is None:
+            gaps.append("snapshot_time_invalid")
+        else:
+            now = datetime.now(UTC).astimezone(captured.tzinfo)
+            age = (now - captured).total_seconds()
+            if age > (max_age_seconds or binding.max_quote_age_seconds):
+                gaps.append("snapshot_stale")
+            elif age < -1:
+                gaps.append("snapshot_from_future")
+    except (TypeError, ValueError):
+        gaps.append("snapshot_time_invalid")
+    return list(dict.fromkeys(gaps))
 
 
 def _order_matches(item: BrokerOrder, order: AuthorizedOrder, *, time_window_seconds: int) -> bool:
@@ -1274,4 +1846,20 @@ def _order_matches(item: BrokerOrder, order: AuthorizedOrder, *, time_window_sec
         right = datetime.fromisoformat(order.authorized_at)
         return abs((left - right).total_seconds()) <= time_window_seconds
     except (TypeError, ValueError):
-        return True
+        # An unparsable broker time cannot establish the mandated bounded
+        # matching window and must never be treated as a match.
+        return False
+
+
+def matching_broker_orders(
+    snapshot: BrokerSnapshot,
+    order: AuthorizedOrder,
+    *,
+    time_window_seconds: int = 60,
+) -> list[BrokerOrder]:
+    """Return only broker orders that satisfy the full bounded match key."""
+    return [
+        item
+        for item in snapshot.orders
+        if _order_matches(item, order, time_window_seconds=time_window_seconds)
+    ]

@@ -15,7 +15,9 @@ from pa_agent.trading.execution_simulator import AShareCostModel, AShareExecutio
 from pa_agent.trading.lifecycle import TradeLifecycleTracker
 from pa_agent.trading.models import AssetClass, PlanStatus, TradePlan
 from pa_agent.trading.quant import SignalDecision, SignalStatus
+from pa_agent.trading.store import TradeStore
 from pa_agent.trading.topdown import (
+    TOPDOWN_STRATEGY_ID,
     HotspotItem,
     HotspotSnapshot,
     IndexScoreInput,
@@ -25,9 +27,8 @@ from pa_agent.trading.topdown import (
     TopDownScoringContext,
 )
 from pa_agent.trading.topdown_replay import TopDownReplayEngine, TopDownReplayFrame
-from pa_agent.trading.store import TradeStore
 
-FIXTURE_VERSION = "topdown_mechanics_v2"
+FIXTURE_VERSION = "topdown_mechanics_v3_cloud_ai"
 SIGNAL_AT = "2026-01-05T15:00:00+08:00"
 FIRST = "2026-01-06T09:45:00+08:00"
 SECOND = "2026-01-06T10:00:00+08:00"
@@ -171,7 +172,7 @@ def run_fixed_mechanism_validation() -> FixedMechanismValidationReport:
         checks=checks,
         limitations=[
             "固定回放仅证明时间对齐、评分和成交机制，不证明策略收益。",
-            "历史热点、情绪和沪深300历史成分不足时，不得用于样本外晋级。",
+            "历史热点、情绪和冻结云算力股票池定义不足时，不得用于当前策略样本外晋级。",
             "仍需至少200笔样本外和12周/80笔影子交易满足晋级门槛。",
         ],
     )
@@ -180,7 +181,7 @@ def run_fixed_mechanism_validation() -> FixedMechanismValidationReport:
 def _signal() -> SignalDecision:
     return SignalDecision(
         status=SignalStatus.ALLOW,
-        strategy_id="hs300_daily_pullback_v1",
+        strategy_id="cloud_ai_daily_pullback_v1",
         parameter_version="1.0.0",
         pool_version="hs300-2026-01",
         symbol="600519",
@@ -307,7 +308,7 @@ def _lifecycle_checks() -> list[ValidationCheck]:
             asset_class=AssetClass.A_SHARE.value,
             original_decision={},
             final_decision={},
-            meta={"strategy_version": "hs300_topdown_4321_intraday_v1"},
+            meta={"strategy_version": TOPDOWN_STRATEGY_ID},
         )
         plan = TradePlan(
             id="lifecycle-fixture-plan",
@@ -322,7 +323,7 @@ def _lifecycle_checks() -> list[ValidationCheck]:
             take_profit_price=110,
             status=PlanStatus.PROPOSED,
             shadow_status="proposed",
-            strategy_version="hs300_topdown_4321_intraday_v1",
+            strategy_version=TOPDOWN_STRATEGY_ID,
             created_at="2026-01-05T15:00:00+08:00",
             risk_snapshot={
                 "max_entry_price": 103,

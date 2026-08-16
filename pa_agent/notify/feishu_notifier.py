@@ -28,10 +28,10 @@ import base64
 import hashlib
 import hmac
 import logging
-import time
 import threading
+import time
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pa_agent.config.settings import Settings
@@ -404,4 +404,218 @@ def send_order_signal(
             return False
     except Exception as exc:
         logger.warning("飞书通知 HTTP 请求失败: %s", exc)
+        return False
+
+
+def send_quant_tradeable_signal(
+    *,
+    sandbox: Any,
+    settings: "Settings | None" = None,
+) -> bool:
+    """Send one deterministic 4:3:2:1 tradeable-state notification.
+
+    ``sandbox`` is a frozen per-symbol state projection.  The function only
+    reports that state; it never changes a score, authorizes an order or calls
+    an AI model.
+    """
+    cfg = _feishu_config_dict(settings)
+    if not cfg.get("enabled", True):
+        logger.debug("飞书量化提醒已禁用")
+        return False
+    webhook_url = (cfg.get("webhook_url") or "").strip()
+    if not webhook_url:
+        logger.info("飞书量化提醒未发送：尚未配置 Webhook URL")
+        return False
+    try:
+        import requests  # type: ignore[import]
+    except ImportError:
+        logger.warning("飞书量化提醒失败：requests 库未安装")
+        return False
+
+    data = (
+        sandbox.model_dump(mode="json")
+        if hasattr(sandbox, "model_dump")
+        else dict(sandbox)
+    )
+    score = data.get("total_score")
+    score_text = "—" if score is None else f"{float(score):.1f}/100"
+    component_text = " / ".join(
+        f"{label}{'—' if data.get(key) is None else f'{float(data[key]):.1f}'}"
+        for label, key in (
+            ("指数", "index_score"),
+            ("情绪", "sentiment_score"),
+            ("题材", "theme_score"),
+            ("个股", "stock_score"),
+        )
+    )
+    price_text = (
+        f"触发价 {data.get('trigger_price') or '—'} / "
+        f"最高允许价 {data.get('max_entry_price') or '—'} / "
+        f"初始止损 {data.get('initial_stop') or '—'}"
+    )
+    hotspot = data.get("hotspot_title") or data.get("hotspot_status") or "无有效热点摘要"
+    live_enabled = bool(
+        getattr(getattr(settings, "portfolio_risk", None), "live_trading_enabled", False)
+    )
+    state = str(data.get("state") or "")
+    account_risk_status = str(data.get("account_risk_status") or "")
+    if live_enabled and not (
+        state == "authorized" and account_risk_status == "authorized"
+    ):
+        logger.warning(
+            "飞书实盘机会未发送 [%s]: 尚未进入账户风控授权状态",
+            data.get("symbol"),
+        )
+        return False
+    if not live_enabled and state != "quant_tradeable":
+        logger.info(
+            "飞书影子机会未发送 [%s]: 当前不是影子可交易状态",
+            data.get("symbol"),
+        )
+        return False
+    mode_label = "实盘机会" if live_enabled else "影子机会"
+    account_text = (
+        "账户与组合风控已授权"
+        if live_enabled else
+        "影子模式风险门禁已通过，不会形成真实委托"
+    )
+    closing_note = (
+        "账户与组合风控已经授权；仍须由你在PA Agent安全预填，并在同花顺中最终确认。"
+        if live_enabled else
+        "该机会仅进入影子生命周期，不会预填或提交任何真实委托。"
+    )
+    content = (
+        f"**模式**：{mode_label}\n"
+        f"**量化状态**：{data.get('state_label') or '量化可交易'}\n"
+        f"**股票**：{data.get('name') or ''} {data.get('symbol') or ''}\n"
+        f"**4:3:2:1评分**：{score_text}（{component_text}）\n"
+        f"**连续确认**：{data.get('consecutive_pass_count') or 0} 根已收盘15分钟K线\n"
+        f"**交易计划**：{price_text}\n"
+        f"**有效期**：{data.get('valid_until') or '—'}\n"
+        f"**热点**：{_truncate(str(hotspot), 180)}\n"
+        f"**账户状态**：{account_text}\n\n"
+        f"{closing_note}"
+    )
+    payload: dict[str, Any] = {
+        "msg_type": "interactive",
+        "card": {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": (
+                        f"PA Agent {mode_label} · {data.get('name') or ''} "
+                        f"{data.get('symbol') or ''}"
+                    ).strip(),
+                },
+                "template": "green",
+            },
+            "body": {
+                "direction": "vertical",
+                "elements": [{"tag": "markdown", "content": content}],
+            },
+        },
+    }
+    secret = (cfg.get("secret") or "").strip()
+    if secret:
+        timestamp = int(time.time())
+        payload["timestamp"] = str(timestamp)
+        payload["sign"] = _gen_sign(secret, timestamp)
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=_REQUEST_TIMEOUT_S,
+        )
+        result = response.json()
+        delivered = result.get("code") == 0 or result.get("StatusCode") == 0
+        if delivered:
+            logger.info(
+                "飞书量化可交易提醒已发送 [%s %s]",
+                data.get("symbol"),
+                score_text,
+            )
+        else:
+            logger.warning("飞书量化提醒返回错误 [%s]: %s", data.get("symbol"), result)
+        return delivered
+    except Exception as exc:
+        logger.warning("飞书量化提醒 HTTP 请求失败 [%s]: %s", data.get("symbol"), exc)
+        return False
+
+
+def send_quant_exit_signal(
+    *,
+    sandbox: Any,
+    settings: "Settings | None" = None,
+) -> bool:
+    """Send one deterministic exit-required notification.
+
+    The card reports the already-persisted lifecycle state.  It never submits,
+    cancels, or confirms a broker order.
+    """
+    cfg = _feishu_config_dict(settings)
+    if not cfg.get("enabled", True):
+        return False
+    webhook_url = (cfg.get("webhook_url") or "").strip()
+    if not webhook_url:
+        return False
+    try:
+        import requests  # type: ignore[import]
+    except ImportError:
+        logger.warning("飞书量化退出提醒失败：requests 库未安装")
+        return False
+    data = (
+        sandbox.model_dump(mode="json")
+        if hasattr(sandbox, "model_dump")
+        else dict(sandbox)
+    )
+    blocks = "、".join(str(item) for item in data.get("hard_blocks") or [])
+    content = (
+        f"**股票**：{data.get('name') or ''} {data.get('symbol') or ''}\n"
+        f"**状态**：{data.get('state_label') or '需要退出'}\n"
+        f"**计划**：{data.get('plan_id') or '—'}\n"
+        f"**当前价**：{data.get('latest_price') or '—'}\n"
+        f"**保护止损**：{data.get('initial_stop') or '—'}\n"
+        f"**触发依据**：{blocks or data.get('action') or '既定退出规则'}\n\n"
+        "请打开PA Agent核对退出计划，并由你本人在同花顺中最终确认。"
+    )
+    payload: dict[str, Any] = {
+        "msg_type": "interactive",
+        "card": {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": (
+                        f"PA Agent 退出提醒 · {data.get('name') or ''} "
+                        f"{data.get('symbol') or ''}"
+                    ).strip(),
+                },
+                "template": "red",
+            },
+            "body": {
+                "direction": "vertical",
+                "elements": [{"tag": "markdown", "content": content}],
+            },
+        },
+    }
+    secret = (cfg.get("secret") or "").strip()
+    if secret:
+        timestamp = int(time.time())
+        payload["timestamp"] = str(timestamp)
+        payload["sign"] = _gen_sign(secret, timestamp)
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=_REQUEST_TIMEOUT_S,
+        )
+        result = response.json()
+        return result.get("code") == 0 or result.get("StatusCode") == 0
+    except Exception as exc:
+        logger.warning("飞书量化退出提醒 HTTP 请求失败 [%s]: %s", data.get("symbol"), exc)
         return False

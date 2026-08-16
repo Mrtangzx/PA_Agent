@@ -15,7 +15,9 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from pa_agent.data.base import KlineBar
+from pa_agent.data.ashare_common import is_a_share_stock_symbol
 from pa_agent.trading.quant import Hs300DailyPullbackStrategy, SignalDecision, StrategyContext
+from pa_agent.trading.topdown import MANUAL_EXCEPTION_STRATEGY_ID
 
 
 class DailyCandidateScanResult(BaseModel):
@@ -31,6 +33,14 @@ class DailyCandidateScanResult(BaseModel):
         return [item for item in self.decisions if item.status.value == "allow"]
 
 
+class ManualExceptionEvaluation(BaseModel):
+    """One pool-external review tied to a freshly scanned base universe."""
+
+    base_pool_version: str
+    base_scan: DailyCandidateScanResult
+    decision: SignalDecision
+
+
 class DailyCandidateScanner:
     """Scan the latest common closed day for the active fixed trading pool."""
 
@@ -40,6 +50,7 @@ class DailyCandidateScanner:
         *,
         stock_daily_loader: Callable[..., list[dict[str, Any]]] | None = None,
         index_daily_loader: Callable[..., list[dict[str, Any]]] | None = None,
+        profile_loader: Callable[[str], dict[str, Any] | None] | None = None,
         max_workers: int = 6,
     ) -> None:
         if stock_daily_loader is None or index_daily_loader is None:
@@ -47,10 +58,197 @@ class DailyCandidateScanner:
 
             stock_daily_loader = stock_daily_loader or fetch_stock_daily_recent
             index_daily_loader = index_daily_loader or fetch_index_daily
+        if profile_loader is None:
+            from pa_agent.data.eastmoney_client import fetch_stock_listing_profile
+
+            profile_loader = fetch_stock_listing_profile
         self.strategy = strategy
         self.stock_daily_loader = stock_daily_loader
         self.index_daily_loader = index_daily_loader
+        self.profile_loader = profile_loader
         self.max_workers = max_workers
+
+    def evaluate_manual_exception_from_pool(
+        self,
+        symbol: str,
+        *,
+        pool_snapshot: dict[str, Any],
+        captured_at: datetime | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> ManualExceptionEvaluation:
+        """Refresh the base-pool breadth before reviewing an outside-pool stock.
+
+        A manual query must not borrow an old or unverifiable breadth value.  The
+        current immutable pool is scanned with the production daily strategy;
+        only a complete scan can supply the breadth used by the exception.
+        """
+        now = (captured_at or datetime.now().astimezone()).astimezone()
+        pool_version = str(pool_snapshot.get("version") or "")
+        base_scan = self.scan(
+            pool_snapshot,
+            captured_at=now,
+            progress=progress,
+        )
+        if not base_scan.data_complete or base_scan.market_breadth_pct is None:
+            decision = self._manual_reject(
+                str(symbol).strip(),
+                self._manual_pool_version(str(symbol).strip(), pool_version, now),
+                now,
+                ["base_pool_breadth_incomplete", *base_scan.data_gaps],
+            )
+        else:
+            decision = self.evaluate_manual_exception(
+                symbol,
+                base_pool_version=pool_version,
+                market_breadth_pct=base_scan.market_breadth_pct,
+                captured_at=now,
+            )
+        return ManualExceptionEvaluation(
+            base_pool_version=pool_version,
+            base_scan=base_scan,
+            decision=decision,
+        )
+
+    def evaluate_manual_exception(
+        self,
+        symbol: str,
+        *,
+        base_pool_version: str,
+        market_breadth_pct: float,
+        captured_at: datetime | None = None,
+    ) -> SignalDecision:
+        """Evaluate one pool-external A share without mutating the base universe."""
+        now = (captured_at or datetime.now().astimezone()).astimezone()
+        symbol = str(symbol).strip()
+        pool_version = self._manual_pool_version(symbol, base_pool_version, now)
+        if not is_a_share_stock_symbol(symbol):
+            return self._manual_reject(
+                symbol, pool_version, now, ["a_share_stock_symbol_required"]
+            )
+        try:
+            profile = self.profile_loader(symbol) or {}
+        except Exception as exc:  # noqa: BLE001
+            return self._manual_reject(
+                symbol, pool_version, now,
+                [f"listing_profile_fetch_failed:{type(exc).__name__}"],
+            )
+        try:
+            stock_rows = _closed_daily_rows(
+                self.stock_daily_loader(symbol, n=90, adjust="qfq"), now
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._manual_reject(
+                symbol, pool_version, now,
+                [f"stock_daily_fetch_failed:{type(exc).__name__}"],
+            )
+        if len(stock_rows) < 65:
+            return self._manual_reject(
+                symbol, pool_version, now, ["stock_requires_65_closed_daily_bars"]
+            )
+        signal_day = stock_rows[-1]["_date"]
+        start = (signal_day - timedelta(days=150)).strftime("%Y%m%d")
+        end = signal_day.strftime("%Y%m%d")
+        try:
+            index_rows = _closed_daily_rows(
+                self.index_daily_loader("000300", start_date=start, end_date=end), now
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._manual_reject(
+                symbol, pool_version, now,
+                [f"hs300_daily_fetch_failed:{type(exc).__name__}"],
+            )
+        index_rows = [item for item in index_rows if item["_date"] <= signal_day]
+        if len(index_rows) < 65 or index_rows[-1]["_date"] != signal_day:
+            return self._manual_reject(
+                symbol, pool_version, now,
+                ["hs300_requires_65_bars_aligned_to_signal_day"],
+            )
+
+        eligibility: list[str] = []
+        name = str(profile.get("name") or symbol).strip()
+        industry = str(profile.get("industry") or "").strip()
+        listing_date = _profile_date(profile.get("listing_date"))
+        if listing_date is None:
+            eligibility.append("missing_listing_date")
+        elif (signal_day - listing_date).days < 120:
+            eligibility.append("listed_less_than_120_days")
+        if "ST" in name.upper():
+            eligibility.append("st")
+        if "退" in name:
+            eligibility.append("delisting_period")
+        if not industry:
+            eligibility.append("missing_industry")
+        if any(float(item.get("amount") or 0) <= 0 for item in stock_rows[-20:]):
+            eligibility.append("insufficient_20_day_amount_data")
+
+        signal_time = datetime.combine(
+            signal_day, time(15, 0), tzinfo=now.tzinfo
+        ).isoformat()
+        next_time = datetime.combine(
+            _next_weekday(signal_day), time(15, 0), tzinfo=now.tzinfo
+        ).isoformat()
+        decision = self.strategy.evaluate(StrategyContext(
+            symbol=symbol,
+            bars=_to_bars(stock_rows),
+            index_bars=_to_bars(index_rows),
+            market_breadth_pct=market_breadth_pct,
+            pool_version=pool_version,
+            signal_time=signal_time,
+            next_trading_time=next_time,
+            eligible=not eligibility,
+            eligibility_reasons=tuple(eligibility),
+        ))
+        return decision.model_copy(update={
+            "strategy_id": MANUAL_EXCEPTION_STRATEGY_ID,
+            "parameter_version": f"{decision.parameter_version}+manual-exception-1.0.0",
+            "condition_snapshot": {
+                **decision.condition_snapshot,
+                "manual_exception": True,
+                "daily_baseline_strategy": decision.strategy_id,
+                "base_pool_version": base_pool_version,
+                "expected_security_name": name,
+                "industry": industry,
+                "risk_multiplier": 0.5,
+                "max_concurrent_positions": 1,
+            },
+        })
+
+    @staticmethod
+    def _manual_pool_version(
+        symbol: str,
+        base_pool_version: str,
+        now: datetime,
+    ) -> str:
+        return (
+            f"manual-exception-{base_pool_version}-{now.date().isoformat()}-{symbol}"
+        )
+
+    def _manual_reject(
+        self,
+        symbol: str,
+        pool_version: str,
+        now: datetime,
+        reasons: list[str],
+    ) -> SignalDecision:
+        return SignalDecision(
+            status="reject",
+            strategy_id=MANUAL_EXCEPTION_STRATEGY_ID,
+            parameter_version=(
+                f"{self.strategy.settings.parameter_version}+manual-exception-1.0.0"
+            ),
+            pool_version=pool_version,
+            symbol=symbol,
+            signal_time=now.isoformat(),
+            reasons=list(dict.fromkeys(reasons)),
+            condition_snapshot={
+                "manual_exception": True,
+                "base_pool_version": _manual_base_pool_version(
+                    pool_version, day=now.date(), symbol=symbol
+                ),
+                "risk_multiplier": 0.5,
+                "max_concurrent_positions": 1,
+            },
+        )
 
     def scan(
         self,
@@ -213,3 +411,25 @@ def _next_weekday(day: date) -> date:
     while result.weekday() >= 5:
         result += timedelta(days=1)
     return result
+
+
+def _profile_date(value: Any) -> date | None:
+    text = str(value or "").strip().replace("-", "")
+    if len(text) != 8 or not text.isdigit():
+        return None
+    try:
+        return datetime.strptime(text, "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _manual_base_pool_version(
+    pool_version: str, *, day: date, symbol: str
+) -> str:
+    prefix = "manual-exception-"
+    value = str(pool_version)
+    if not value.startswith(prefix):
+        return ""
+    body = value[len(prefix):]
+    suffix = f"-{day.isoformat()}-{symbol}"
+    return body[:-len(suffix)] if body.endswith(suffix) else body

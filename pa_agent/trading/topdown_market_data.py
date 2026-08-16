@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from pa_agent.data.base import KlineBar
 from pa_agent.trading.broker_models import BrokerSnapshot
+from pa_agent.trading.hotspots import HOTSPOT_RULE_VERSION
 from pa_agent.trading.quant import SignalDecision
 from pa_agent.trading.topdown import (
     HotspotSnapshot,
@@ -22,6 +23,7 @@ from pa_agent.trading.topdown import (
     StockScoreInput,
     ThemeScoreInput,
     TopDownScoreSnapshot,
+    TopDownScoreStatus,
     TopDownScoring,
     TopDownScoringContext,
 )
@@ -82,7 +84,8 @@ class TopDownMarketDataService:
         minute_end = now.strftime("%Y-%m-%d %H:%M:%S")
         gaps: list[str] = []
         indexes: list[IndexScoreInput] = []
-        closed_at: datetime | None = None
+        expected_close = expected_topdown_bar_close(now)
+        component_closes: dict[str, datetime] = {}
 
         for code, name in INDEX_NAMES.items():
             try:
@@ -98,7 +101,7 @@ class TopDownMarketDataService:
                 )
                 item, item_closed_at = _index_input(code, name, daily, minute)
                 indexes.append(item)
-                closed_at = item_closed_at if closed_at is None else min(closed_at, item_closed_at)
+                component_closes[f"index_{code}"] = item_closed_at
             except (ValueError, TypeError, KeyError) as exc:
                 gaps.append(f"index_{code}_incomplete:{exc}")
 
@@ -120,7 +123,7 @@ class TopDownMarketDataService:
                 now=now,
             )
             latest_stock = stock_minutes[-1]
-            closed_stock_bar = KlineBar(
+            candidate_closed_stock_bar = KlineBar(
                 seq=1,
                 ts_open=latest_stock["_timestamp"].timestamp() * 1000,
                 open=float(latest_stock["open"]),
@@ -131,12 +134,19 @@ class TopDownMarketDataService:
                 amount=float(latest_stock.get("amount") or 0),
                 closed=True,
             )
-            closed_at = stock_closed_at if closed_at is None else min(closed_at, stock_closed_at)
+            component_closes["stock"] = stock_closed_at
+            if expected_close is not None and stock_closed_at == expected_close:
+                closed_stock_bar = candidate_closed_stock_bar
         except (ValueError, TypeError, KeyError) as exc:
             gaps.append(f"stock_15m_incomplete:{exc}")
 
         theme: ThemeScoreInput | None = None
-        if hotspot is not None and theme_metrics is not None:
+        if hotspot is not None and hotspot.rule_version != HOTSPOT_RULE_VERSION:
+            gaps.append(
+                "hotspot_rule_version_mismatch:"
+                f"{hotspot.rule_version or 'missing'}:{HOTSPOT_RULE_VERSION}"
+            )
+        elif hotspot is not None and theme_metrics is not None:
             required = {
                 "relative_strength_percentile", "advancing_pct", "main_net_inflow_pct",
                 "turnover_vs_recent", "persistence_days",
@@ -157,7 +167,16 @@ class TopDownMarketDataService:
                 "seal_blast_new_high_low_and_hs300_breadth"
             )
 
-        bar_closed_at = (closed_at or _latest_expected_close(now)).isoformat()
+        if expected_close is None:
+            gaps.append("outside_valid_topdown_capture_window")
+            expected_close = _latest_expected_close(now)
+        for component, value in component_closes.items():
+            if value != expected_close:
+                gaps.append(
+                    f"bar_time_mismatch:{component}:{value.isoformat()}:"
+                    f"expected:{expected_close.isoformat()}"
+                )
+        bar_closed_at = expected_close.isoformat()
         source_timestamps = {
             "bar": bar_closed_at,
             "broker": broker.captured_at,
@@ -184,13 +203,35 @@ class TopDownMarketDataService:
         )
 
     def evaluate_and_store(self, result: TopDownContextBuildResult, store) -> TopDownScoreSnapshot:
-        score = self.scoring.evaluate(result.context)
-        if result.data_gaps:
-            score = score.model_copy(update={
-                "data_gaps": list(dict.fromkeys([*score.data_gaps, *result.data_gaps])),
-            })
+        score = self.evaluate(result)
         store.add_topdown_score(score)
         return score
+
+    def evaluate(self, result: TopDownContextBuildResult) -> TopDownScoreSnapshot:
+        """Apply orchestration gaps to the score as a fail-closed result.
+
+        ``TopDownScoring`` only sees the typed inputs.  Time-alignment and
+        source-version failures are discovered while building those inputs and
+        must invalidate the aggregate score as well; merely appending a gap to
+        an otherwise eligible result would expose a contradictory state to the
+        per-stock sandbox.
+        """
+        score = self.scoring.evaluate(result.context)
+        gaps = list(dict.fromkeys([*score.data_gaps, *result.data_gaps]))
+        if not gaps:
+            return score
+        return score.model_copy(
+            update={
+                "total_score": None,
+                "consecutive_pass_count": 0,
+                "data_gaps": gaps,
+                "status": (
+                    TopDownScoreStatus.AUTHORIZATION_REVOKED
+                    if result.context.authorization_open
+                    else TopDownScoreStatus.DATA_INCOMPLETE
+                ),
+            }
+        )
 
 
 def _closed_rows(rows: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
@@ -258,6 +299,8 @@ def _stock_input(
     quote = broker.quote if broker.quote and broker.quote.symbol == symbol else None
     if quote is None or quote.last_price is None or not quote.captured_at:
         raise ValueError("matching_broker_quote_required")
+    if not quote.execution_state_verified:
+        raise ValueError("broker_quote_execution_state_unverified")
     quote_at = datetime.fromisoformat(quote.captured_at)
     if quote_at.tzinfo is None:
         quote_at = quote_at.replace(tzinfo=now.tzinfo)
@@ -304,3 +347,39 @@ def _stock_input(
 def _latest_expected_close(now: datetime) -> datetime:
     minute = now.minute - (now.minute % 15)
     return now.replace(minute=minute, second=0, microsecond=0)
+
+
+def expected_topdown_bar_close(now: datetime) -> datetime | None:
+    """Return the only bar close allowed for a scheduled live evaluation.
+
+    The 09:45 close is the first score snapshot.  It can never authorize an
+    order by itself because the strategy still requires two consecutive
+    passing snapshots, so the earliest possible authorization remains 10:00.
+    """
+    local = now.astimezone()
+    if local.weekday() >= 5 or local.minute % 15 > 4:
+        return None
+    minute = local.minute - local.minute % 15
+    candidate = local.replace(minute=minute, second=0, microsecond=0)
+    clock = (candidate.hour, candidate.minute)
+    if (9, 45) <= clock <= (11, 30) or (13, 15) <= clock <= (15, 0):
+        return candidate
+    return None
+
+
+def expected_oos_market_close(now: datetime) -> datetime | None:
+    """Return the live 15m close or the bounded 15:00 daily recovery close.
+
+    Intraday, sentiment and theme evidence remains limited to five minutes.
+    The daily bar has a separately documented fifteen-minute availability
+    window, so 15:05-15:14 may recover only the daily warm-up observation.
+    """
+    live_close = expected_topdown_bar_close(now)
+    if live_close is not None:
+        return live_close
+    local = now.astimezone()
+    if local.weekday() >= 5:
+        return None
+    if local.hour == 15 and 5 <= local.minute <= 14:
+        return local.replace(hour=15, minute=0, second=0, microsecond=0)
+    return None

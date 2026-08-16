@@ -28,6 +28,12 @@ DATA_SOURCE_CHOICES: tuple[tuple[DataSourceKind, str], ...] = (
     ("eastmoney_futures", "国内期货"),
 )
 
+# Production UI scope. Legacy source implementations remain importable for
+# historical records and tests, but they are not reachable from the live app.
+PRODUCTION_DATA_SOURCE_CHOICES: tuple[tuple[DataSourceKind, str], ...] = tuple(
+    item for item in DATA_SOURCE_CHOICES if item[0] == "eastmoney"
+)
+
 _HIDDEN_KINDS: frozenset[DataSourceKind] = frozenset(
     {"akshare", "tushare", "yfinance"}
 )
@@ -49,11 +55,11 @@ def default_tradingview_exchange() -> str:
 
 
 def normalize_data_source_kind(kind: str | None) -> DataSourceKind:
-    """Return a supported data-source kind, defaulting to MT5."""
+    """Return a known source kind; unknown production values use A shares."""
     supported = {k for k, _ in DATA_SOURCE_CHOICES} | _HIDDEN_KINDS
     if kind in supported:
         return kind  # type: ignore[return-value]
-    return "mt5"
+    return "eastmoney"
 
 
 def data_source_label(kind: str | None) -> str:

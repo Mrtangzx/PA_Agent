@@ -46,6 +46,49 @@ def test_store_round_trips_universe_score_and_hotspot(tmp_path) -> None:
     assert latest is not None
     assert latest["snapshot"]["total_score"] == 75
 
+    current = score.model_copy(update={
+        "strategy_version": "cloud_ai_topdown_4321_intraday_v1",
+        "scoring_version": "1.1.0",
+        "bar_closed_at": "2026-08-12T10:15:00+08:00",
+        "input_hash": "c" * 64,
+    })
+    store.add_topdown_score(current)
+    filtered = store.latest_topdown_score(
+        "600519",
+        strategy_version="hs300_topdown_4321_intraday_v1",
+        scoring_version="1.0.0",
+    )
+    assert filtered is not None
+    assert filtered["snapshot"]["bar_closed_at"] == NOW
+    current_rows = store.list_topdown_scores(
+        strategy_version="cloud_ai_topdown_4321_intraday_v1",
+        scoring_version="1.1.0",
+    )
+    assert [item["snapshot"]["input_hash"] for item in current_rows] == ["c" * 64]
+
+    manual = current.model_copy(update={
+        "pool_version": "manual-exception-hs300-2026-08-2026-08-12-600519",
+        "bar_closed_at": "2026-08-12T10:30:00+08:00",
+        "input_hash": "d" * 64,
+    })
+    store.add_topdown_score(manual)
+    base_only = store.latest_topdown_score(
+        "600519",
+        strategy_version="cloud_ai_topdown_4321_intraday_v1",
+        scoring_version="1.1.0",
+        pool_version="hs300-2026-08",
+    )
+    assert base_only is not None
+    assert base_only["snapshot"]["input_hash"] == "c" * 64
+    manual_only = store.latest_topdown_score(
+        "600519",
+        strategy_version="cloud_ai_topdown_4321_intraday_v1",
+        scoring_version="1.1.0",
+        pool_version=manual.pool_version,
+    )
+    assert manual_only is not None
+    assert manual_only["snapshot"]["input_hash"] == "d" * 64
+
     hotspot = HotspotSnapshot(
         symbol="600519",
         captured_at=NOW,

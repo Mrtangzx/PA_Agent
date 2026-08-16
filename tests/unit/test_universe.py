@@ -89,13 +89,13 @@ def test_current_universe_fails_closed_when_one_member_data_is_missing() -> None
         source_url="official",
         source_hash="b" * 64,
         constituents=[
-            OfficialConstituent(symbol=f"000{index:03d}", name=f"股票{index}")
+            OfficialConstituent(symbol=f"001{index:03d}", name=f"股票{index}")
             for index in range(31)
         ],
     )
 
     def daily(symbol: str, **_kwargs):
-        if symbol == "000030":
+        if symbol == "001030":
             return []
         return [
             {
@@ -123,7 +123,7 @@ def test_current_universe_fails_closed_when_one_member_data_is_missing() -> None
     snapshot = service.generate(as_of=date(2026, 8, 13))
 
     assert not snapshot.data_complete
-    assert snapshot.rejected["000030"] == ["insufficient_20_day_amount_data"]
+    assert snapshot.rejected["001030"] == ["insufficient_20_day_amount_data"]
     assert "member_data_incomplete" in snapshot.completeness_reasons
 
 

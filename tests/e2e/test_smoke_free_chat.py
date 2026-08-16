@@ -1,4 +1,4 @@
-"""E2E smoke test �?free-chat session after two-stage analysis.
+"""E2E smoke test for a free-chat session after two-stage analysis.
 
 Task 19.4
 """
@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from pa_agent.app_context import AppContext
+from pa_agent.config.settings import Settings
 from tests.fixtures.kline_bars import make_newest_first_bars
 from tests.fixtures.validators import schema_test_validator
 from pa_agent.ai.router import route_strategy_files
@@ -61,6 +62,9 @@ def _make_ctx(tmp_path):
     pending_writer = MagicMock()
 
     ctx = AppContext()
+    ctx.settings = Settings()
+    ctx.settings.general.alert_on_order_opportunity = False
+    ctx.settings.general.decision_flow_auto_play = False
     ctx.client = mock_client
     ctx.assembler = mock_assembler
     ctx.router = route_strategy_files
@@ -86,8 +90,8 @@ def test_free_chat_after_analysis(qtbot, tmp_path):
     qtbot.addWidget(window)
     window.show()
 
-    window._ctx.settings.general.analysis_bar_count = 5
-    window._last_frame_ready_bars = make_newest_first_bars(9, with_forming=True)
+    window._ctx.settings.general.analysis_bar_count = 20
+    window._last_frame_ready_bars = make_newest_first_bars(24, with_forming=True)
 
     window._on_submit_analysis()
 
@@ -119,6 +123,7 @@ def test_free_chat_after_analysis(qtbot, tmp_path):
     # Send one message via the session directly (simulating what the UI does)
     cancel_token = CancelToken()
     reply = session.send("What do you think about the entry?", cancel_token)
+    assert reply.content == CHAT_REPLY_CONTENT
 
     # FreeChatSession should have completed one turn
     assert session._turn == 1, f"Expected 1 turn, got {session._turn}"
@@ -129,6 +134,7 @@ def test_free_chat_after_analysis(qtbot, tmp_path):
     call_args = pending_writer.append_followup.call_args
     record_id_arg = call_args[0][0]
     followup_turn_arg = call_args[0][1]
+    assert record_id_arg == session.record_id
     assert followup_turn_arg.turn == 1
     assert followup_turn_arg.cancelled is False
 

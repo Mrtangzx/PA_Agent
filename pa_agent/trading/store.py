@@ -10,14 +10,14 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
 from pa_agent.trading.models import Execution, InstrumentProfile, TradePlan, TradeResult
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 19
 
 
 def _now() -> str:
@@ -137,6 +137,7 @@ class TradeStore:
                     quantity REAL NOT NULL,
                     real_contract TEXT NOT NULL DEFAULT '',
                     fees REAL NOT NULL DEFAULT 0,
+                    account_fingerprint TEXT NOT NULL DEFAULT '',
                     note TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
@@ -248,6 +249,7 @@ class TradeStore:
                 );
                 CREATE TABLE IF NOT EXISTS broker_order_links (
                     id TEXT PRIMARY KEY,
+                    account_fingerprint TEXT NOT NULL,
                     plan_id TEXT NOT NULL REFERENCES trade_plans(id),
                     broker_order_id TEXT NOT NULL,
                     broker_fill_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -255,7 +257,7 @@ class TradeStore:
                     details_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(plan_id, broker_order_id)
+                    UNIQUE(account_fingerprint, plan_id, broker_order_id)
                 );
                 CREATE TABLE IF NOT EXISTS universe_snapshots (
                     version TEXT PRIMARY KEY,
@@ -316,7 +318,8 @@ class TradeStore:
                     approved_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS external_broker_trades (
-                    broker_fill_id TEXT PRIMARY KEY,
+                    identity TEXT PRIMARY KEY,
+                    broker_fill_id TEXT NOT NULL,
                     account_fingerprint TEXT NOT NULL,
                     broker_order_id TEXT NOT NULL DEFAULT '',
                     symbol TEXT NOT NULL,
@@ -326,7 +329,8 @@ class TradeStore:
                     fees REAL NOT NULL DEFAULT 0,
                     filled_at TEXT NOT NULL,
                     fill_json TEXT NOT NULL,
-                    first_seen_at TEXT NOT NULL
+                    first_seen_at TEXT NOT NULL,
+                    UNIQUE(account_fingerprint,broker_fill_id)
                 );
                 CREATE TABLE IF NOT EXISTS strategy_validation_runs (
                     id TEXT PRIMARY KEY,
@@ -339,12 +343,121 @@ class TradeStore:
                     created_at TEXT NOT NULL,
                     UNIQUE(strategy_version,dataset,input_hash)
                 );
+                CREATE TABLE IF NOT EXISTS validation_epochs (
+                    epoch_id TEXT PRIMARY KEY,
+                    strategy_version TEXT NOT NULL,
+                    pool_version TEXT NOT NULL,
+                    member_hash TEXT NOT NULL,
+                    activated_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    is_current INTEGER NOT NULL DEFAULT 0,
+                    epoch_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS lifecycle_processed_bars (
                     plan_id TEXT NOT NULL REFERENCES trade_plans(id),
                     timeframe TEXT NOT NULL,
                     bar_closed_at TEXT NOT NULL,
                     processed_at TEXT NOT NULL,
                     PRIMARY KEY(plan_id,timeframe,bar_closed_at)
+                );
+                CREATE TABLE IF NOT EXISTS oos_observations (
+                    id TEXT PRIMARY KEY,
+                    strategy_version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    symbol TEXT NOT NULL DEFAULT '',
+                    effective_at TEXT NOT NULL,
+                    source_published_at TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    UNIQUE(strategy_version,kind,symbol,effective_at,payload_hash)
+                );
+                CREATE TABLE IF NOT EXISTS stock_sandbox_current (
+                    symbol TEXT NOT NULL,
+                    pool_version TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(symbol,pool_version)
+                );
+                CREATE TABLE IF NOT EXISTS quant_notification_events (
+                    event_key TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    bar_closed_at TEXT NOT NULL DEFAULT '',
+                    plan_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS watchlist_members (
+                    symbol TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'user',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    added_at TEXT NOT NULL,
+                    removed_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS watchlist_sources (
+                    symbol TEXT NOT NULL REFERENCES watchlist_members(symbol),
+                    source TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    added_at TEXT NOT NULL,
+                    removed_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(symbol,source)
+                );
+                CREATE TABLE IF NOT EXISTS ths_watchlist_syncs (
+                    id TEXT PRIMARY KEY,
+                    captured_at TEXT NOT NULL,
+                    source_updated_at TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    member_count INTEGER NOT NULL,
+                    category_count INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_hash,captured_at)
+                );
+                CREATE TABLE IF NOT EXISTS ths_watchlist_scan_results (
+                    scan_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    base_pool_version TEXT NOT NULL,
+                    signal_date TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    actionable_stage TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scan_id,symbol)
+                );
+                CREATE TABLE IF NOT EXISTS stock_selection_snapshots (
+                    id TEXT PRIMARY KEY,
+                    strategy_version TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(strategy_version,generated_at,input_hash)
+                );
+                CREATE TABLE IF NOT EXISTS workbench_preferences (
+                    preference_key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_decision_symbol_time ON decision_events(symbol, created_at);
                 CREATE INDEX IF NOT EXISTS idx_plans_status ON trade_plans(status, shadow_status);
@@ -362,6 +475,19 @@ class TradeStore:
                 CREATE INDEX IF NOT EXISTS idx_external_broker_time ON external_broker_trades(account_fingerprint,filled_at);
                 CREATE INDEX IF NOT EXISTS idx_validation_strategy_time ON strategy_validation_runs(strategy_version,created_at);
                 CREATE INDEX IF NOT EXISTS idx_lifecycle_bar_time ON lifecycle_processed_bars(timeframe,bar_closed_at);
+                CREATE INDEX IF NOT EXISTS idx_oos_observation_time ON oos_observations(strategy_version,kind,effective_at);
+                CREATE INDEX IF NOT EXISTS idx_validation_epoch_current ON validation_epochs(strategy_version,is_current,activated_at);
+                CREATE INDEX IF NOT EXISTS idx_stock_sandbox_state ON stock_sandbox_current(pool_version,state,updated_at);
+                CREATE INDEX IF NOT EXISTS idx_quant_notification_symbol ON quant_notification_events(symbol,event_type,created_at);
+                CREATE INDEX IF NOT EXISTS idx_watchlist_active ON watchlist_members(active,updated_at);
+                CREATE INDEX IF NOT EXISTS idx_watchlist_source_active
+                    ON watchlist_sources(source,active,updated_at);
+                CREATE INDEX IF NOT EXISTS idx_ths_watchlist_sync_time
+                    ON ths_watchlist_syncs(captured_at);
+                CREATE INDEX IF NOT EXISTS idx_ths_watchlist_scan_status
+                    ON ths_watchlist_scan_results(scan_id,status,actionable_stage);
+                CREATE INDEX IF NOT EXISTS idx_stock_selection_generated
+                    ON stock_selection_snapshots(strategy_version,generated_at);
                 """
             )
             plan_columns = {
@@ -369,6 +495,13 @@ class TradeStore:
             }
             if "last_price" not in plan_columns:
                 conn.execute("ALTER TABLE trade_plans ADD COLUMN last_price REAL")
+            conn.execute(
+                """INSERT OR IGNORE INTO watchlist_sources(
+                       symbol,source,active,metadata_json,added_at,removed_at,updated_at
+                   )
+                   SELECT symbol,source,active,metadata_json,added_at,removed_at,updated_at
+                   FROM watchlist_members"""
+            )
             if "last_bar_at" not in plan_columns:
                 conn.execute("ALTER TABLE trade_plans ADD COLUMN last_bar_at TEXT")
             if "actual_mfe" not in plan_columns:
@@ -395,6 +528,14 @@ class TradeStore:
                     "ALTER TABLE trade_plans ADD COLUMN "
                     "actual_time_exit_pending INTEGER NOT NULL DEFAULT 0"
                 )
+            execution_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+            }
+            if "account_fingerprint" not in execution_columns:
+                conn.execute(
+                    "ALTER TABLE executions ADD COLUMN "
+                    "account_fingerprint TEXT NOT NULL DEFAULT ''"
+                )
             state_columns = {
                 row[1]
                 for row in conn.execute("PRAGMA table_info(strategy_state_events)").fetchall()
@@ -409,6 +550,85 @@ class TradeStore:
                     "ALTER TABLE strategy_state_events "
                     "ADD COLUMN approval_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            external_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(external_broker_trades)"
+                ).fetchall()
+            }
+            if external_columns and "identity" not in external_columns:
+                # v13 keyed only by broker_fill_id. Migrate without discarding
+                # existing account data; v14 isolates identical broker IDs
+                # emitted by different accounts/brokers.
+                conn.executescript(
+                    """
+                    ALTER TABLE external_broker_trades
+                    RENAME TO external_broker_trades_v13;
+                    CREATE TABLE external_broker_trades (
+                        identity TEXT PRIMARY KEY,
+                        broker_fill_id TEXT NOT NULL,
+                        account_fingerprint TEXT NOT NULL,
+                        broker_order_id TEXT NOT NULL DEFAULT '',
+                        symbol TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        price REAL NOT NULL,
+                        quantity INTEGER NOT NULL,
+                        fees REAL NOT NULL DEFAULT 0,
+                        filled_at TEXT NOT NULL,
+                        fill_json TEXT NOT NULL,
+                        first_seen_at TEXT NOT NULL,
+                        UNIQUE(account_fingerprint,broker_fill_id)
+                    );
+                    INSERT INTO external_broker_trades(
+                        identity,broker_fill_id,account_fingerprint,
+                        broker_order_id,symbol,direction,price,quantity,fees,
+                        filled_at,fill_json,first_seen_at
+                    )
+                    SELECT account_fingerprint || '|' || broker_fill_id,
+                        broker_fill_id,account_fingerprint,broker_order_id,
+                        symbol,direction,price,quantity,fees,filled_at,
+                        fill_json,first_seen_at
+                    FROM external_broker_trades_v13;
+                    DROP TABLE external_broker_trades_v13;
+                    CREATE INDEX IF NOT EXISTS idx_external_broker_time
+                    ON external_broker_trades(account_fingerprint,filled_at);
+                    """
+                )
+            broker_link_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(broker_order_links)").fetchall()
+            }
+            if broker_link_columns and "account_fingerprint" not in broker_link_columns:
+                # Older links stored the account only inside details_json. Promote it
+                # to a first-class key so identical broker order IDs from different
+                # accounts can never update each other's lifecycle.
+                conn.executescript(
+                    """
+                    ALTER TABLE broker_order_links RENAME TO broker_order_links_v14;
+                    CREATE TABLE broker_order_links (
+                        id TEXT PRIMARY KEY,
+                        account_fingerprint TEXT NOT NULL,
+                        plan_id TEXT NOT NULL REFERENCES trade_plans(id),
+                        broker_order_id TEXT NOT NULL,
+                        broker_fill_ids_json TEXT NOT NULL DEFAULT '[]',
+                        match_status TEXT NOT NULL,
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(account_fingerprint,plan_id,broker_order_id)
+                    );
+                    INSERT INTO broker_order_links(
+                        id,account_fingerprint,plan_id,broker_order_id,
+                        broker_fill_ids_json,match_status,details_json,created_at,updated_at
+                    )
+                    SELECT id,
+                        COALESCE(json_extract(details_json,'$.account_fingerprint'),''),
+                        plan_id,broker_order_id,broker_fill_ids_json,match_status,
+                        details_json,created_at,updated_at
+                    FROM broker_order_links_v14;
+                    DROP TABLE broker_order_links_v14;
+                    """
+                )
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version',?)",
                 (str(SCHEMA_VERSION),),
@@ -416,6 +636,558 @@ class TradeStore:
 
     def health(self) -> dict[str, Any]:
         return {"available": self.available, "error": self.error, "path": str(self.db_path)}
+
+    def upsert_watchlist_member(
+        self,
+        *,
+        symbol: str,
+        name: str,
+        source: str = "user",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Add or reactivate one personal A-share monitor entry.
+
+        The personal watchlist is deliberately separate from versioned strategy
+        universes.  Re-adding a symbol is idempotent and never rewrites strategy
+        history, signals, plans, or fills.
+        """
+        self._require_available()
+        code = str(symbol or "").strip()[-6:]
+        if len(code) != 6 or not code.isdigit():
+            raise ValueError("watchlist symbol must be a 6-digit A-share code")
+        now = _now()
+        payload = dict(metadata or {})
+        with self._write_lock, self._connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM watchlist_members WHERE symbol=?", (code,)
+            ).fetchone()
+            added_at = str(existing["added_at"]) if existing else now
+            existing_metadata = (
+                json.loads(existing["metadata_json"] or "{}") if existing else {}
+            )
+            merged_metadata = {**existing_metadata, **payload}
+            existing_source = str(existing["source"] or "") if existing else ""
+            canonical_source = existing_source or str(source or "user")
+            incoming_name = str(name or code).strip() or code
+            existing_name = str(existing["name"] or "").strip() if existing else ""
+            # External watchlist files contain codes but usually no security
+            # names.  A background re-sync must not downgrade a previously
+            # verified display name back to the six-digit code.
+            resolved_name = (
+                existing_name
+                if incoming_name == code and existing_name and existing_name != code
+                else incoming_name
+            )
+            conn.execute(
+                """INSERT INTO watchlist_members(
+                       symbol,name,source,active,metadata_json,added_at,removed_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(symbol) DO UPDATE SET
+                       name=excluded.name,source=excluded.source,active=1,
+                       metadata_json=excluded.metadata_json,removed_at='',
+                       updated_at=excluded.updated_at""",
+                (code, resolved_name, canonical_source, 1, _json(merged_metadata),
+                 added_at, "", now),
+            )
+            source_row = conn.execute(
+                "SELECT added_at FROM watchlist_sources WHERE symbol=? AND source=?",
+                (code, str(source or "user")),
+            ).fetchone()
+            source_added_at = str(source_row["added_at"]) if source_row else now
+            conn.execute(
+                """INSERT INTO watchlist_sources(
+                       symbol,source,active,metadata_json,added_at,removed_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(symbol,source) DO UPDATE SET
+                       active=1,metadata_json=excluded.metadata_json,removed_at='',
+                       updated_at=excluded.updated_at""",
+                (
+                    code,
+                    str(source or "user"),
+                    1,
+                    _json(payload),
+                    source_added_at,
+                    "",
+                    now,
+                ),
+            )
+        return self.get_watchlist_member(code) or {}
+
+    def remove_watchlist_member(
+        self,
+        symbol: str,
+        *,
+        deferred_reason: str = "",
+        source: str = "",
+    ) -> bool:
+        """Deactivate a personal monitor entry without deleting its audit trail."""
+        self._require_available()
+        code = str(symbol or "").strip()[-6:]
+        now = _now()
+        with self._write_lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT metadata_json FROM watchlist_members WHERE symbol=? AND active=1",
+                (code,),
+            ).fetchone()
+            if row is None:
+                return False
+            metadata = json.loads(row["metadata_json"] or "{}")
+            if deferred_reason:
+                metadata["deferred_removal_reason"] = deferred_reason
+            if source:
+                cursor = conn.execute(
+                    """UPDATE watchlist_sources
+                       SET active=0,removed_at=?,updated_at=?
+                       WHERE symbol=? AND source=? AND active=1""",
+                    (now, now, code, source),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE watchlist_sources
+                       SET active=0,removed_at=?,updated_at=?
+                       WHERE symbol=? AND active=1""",
+                    (now, now, code),
+                )
+            active_sources = conn.execute(
+                "SELECT COUNT(*) FROM watchlist_sources WHERE symbol=? AND active=1",
+                (code,),
+            ).fetchone()[0]
+            conn.execute(
+                """UPDATE watchlist_members
+                   SET active=?,metadata_json=?,removed_at=?,updated_at=?
+                   WHERE symbol=?""",
+                (
+                    int(active_sources > 0),
+                    _json(metadata),
+                    "" if active_sources else now,
+                    now,
+                    code,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def get_watchlist_member(self, symbol: str) -> dict[str, Any] | None:
+        self._require_available()
+        code = str(symbol or "").strip()[-6:]
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM watchlist_members WHERE symbol=?", (code,)
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["active"] = bool(result["active"])
+        result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+        return result
+
+    def list_watchlist_members(
+        self, *, active_only: bool = True, source: str = ""
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        clauses: list[str] = []
+        values: list[Any] = []
+        if active_only:
+            clauses.append("w.active=1")
+        if source:
+            clauses.append(
+                "EXISTS(SELECT 1 FROM watchlist_sources s "
+                "WHERE s.symbol=w.symbol AND s.source=? AND s.active=1)"
+            )
+            values.append(source)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""SELECT w.* FROM watchlist_members w {where}
+                    ORDER BY w.active DESC,w.updated_at DESC,w.symbol ASC""",
+                tuple(values),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        with self._connection() as conn:
+            for row in rows:
+                item = dict(row)
+                item["active"] = bool(item["active"])
+                item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+                source_rows = conn.execute(
+                    """SELECT source,active,metadata_json,added_at,removed_at,updated_at
+                       FROM watchlist_sources WHERE symbol=? ORDER BY source""",
+                    (item["symbol"],),
+                ).fetchall()
+                item["sources"] = [
+                    {
+                        **dict(source_row),
+                        "active": bool(source_row["active"]),
+                        "metadata": json.loads(source_row["metadata_json"] or "{}"),
+                    }
+                    for source_row in source_rows
+                ]
+                result.append(item)
+        return result
+
+    def sync_watchlist_source(
+        self,
+        source: str,
+        members: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Mirror one external watchlist source without removing other origins."""
+        self._require_available()
+        source_name = str(source or "").strip()
+        if not source_name:
+            raise ValueError("watchlist source is required")
+        wanted: set[str] = set()
+        for member in members:
+            code = str(member.get("symbol") or "").strip()[-6:]
+            if len(code) != 6 or not code.isdigit():
+                continue
+            wanted.add(code)
+            self.upsert_watchlist_member(
+                symbol=code,
+                name=str(member.get("name") or code),
+                source=source_name,
+                metadata=dict(member.get("metadata") or {}),
+            )
+        existing = self.list_watchlist_members(active_only=True, source=source_name)
+        removed = 0
+        for item in existing:
+            if item["symbol"] not in wanted and self.remove_watchlist_member(
+                item["symbol"], source=source_name
+            ):
+                removed += 1
+        return {"active": len(wanted), "removed": removed}
+
+    def add_ths_watchlist_sync(self, snapshot: Any) -> str:
+        self._require_available()
+        payload = (
+            snapshot.model_dump(mode="json")
+            if hasattr(snapshot, "model_dump") else dict(snapshot)
+        )
+        sync_id = str(payload.get("id") or uuid.uuid4().hex)
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO ths_watchlist_syncs(
+                       id,captured_at,source_updated_at,source_hash,source_fingerprint,
+                       status,member_count,category_count,snapshot_json,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sync_id,
+                    str(payload.get("captured_at") or _now()),
+                    str(payload.get("source_updated_at") or ""),
+                    str(payload.get("source_hash") or ""),
+                    str(payload.get("source_fingerprint") or ""),
+                    str(payload.get("status") or "complete"),
+                    len(payload.get("members") or []),
+                    len(payload.get("categories") or []),
+                    _json(payload),
+                    _now(),
+                ),
+            )
+        return sync_id
+
+    def latest_ths_watchlist_sync(self) -> dict[str, Any] | None:
+        self._require_available()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM ths_watchlist_syncs ORDER BY captured_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["snapshot"] = json.loads(item.pop("snapshot_json") or "{}")
+        return item
+
+    def upsert_ths_watchlist_scan_result(
+        self, scan_id: str, result: dict[str, Any]
+    ) -> None:
+        self._require_available()
+        now = _now()
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO ths_watchlist_scan_results(
+                       scan_id,symbol,source_hash,base_pool_version,signal_date,
+                       status,actionable_stage,result_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(scan_id,symbol) DO UPDATE SET
+                       status=excluded.status,actionable_stage=excluded.actionable_stage,
+                       result_json=excluded.result_json,updated_at=excluded.updated_at""",
+                (
+                    scan_id,
+                    str(result.get("symbol") or ""),
+                    str(result.get("source_hash") or ""),
+                    str(result.get("base_pool_version") or ""),
+                    str(result.get("signal_date") or ""),
+                    str(result.get("status") or ""),
+                    str(result.get("actionable_stage") or ""),
+                    _json(result),
+                    now,
+                    now,
+                ),
+            )
+
+    def list_ths_watchlist_scan_results(
+        self, *, scan_id: str = "", limit: int = 2000
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE scan_id=?" if scan_id else ""
+        params: tuple[Any, ...] = (scan_id, limit) if scan_id else (limit,)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM ths_watchlist_scan_results {where}
+                    ORDER BY CASE actionable_stage
+                        WHEN 'actionable' THEN 0
+                        WHEN 'next_session_candidate' THEN 1
+                        WHEN 'intraday_observation' THEN 2
+                        WHEN 'not_ready' THEN 3 ELSE 4 END,
+                        symbol LIMIT ?""",
+                params,
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["result"] = json.loads(item.pop("result_json") or "{}")
+            result.append(item)
+        return result
+
+    def latest_ths_watchlist_scan_results(self) -> list[dict[str, Any]]:
+        self._require_available()
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT scan_id FROM ths_watchlist_scan_results
+                   ORDER BY updated_at DESC LIMIT 1"""
+            ).fetchone()
+        return self.list_ths_watchlist_scan_results(scan_id=str(row[0])) if row else []
+
+    def save_workbench_preference(self, key: str, value: Any) -> None:
+        self._require_available()
+        if not str(key or "").strip():
+            raise ValueError("workbench preference key is required")
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT INTO workbench_preferences(preference_key,value_json,updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(preference_key) DO UPDATE SET
+                       value_json=excluded.value_json,updated_at=excluded.updated_at""",
+                (str(key), _json(value), _now()),
+            )
+
+    def get_workbench_preference(self, key: str, default: Any = None) -> Any:
+        self._require_available()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value_json FROM workbench_preferences WHERE preference_key=?",
+                (str(key),),
+            ).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value_json"])
+        except (TypeError, json.JSONDecodeError):
+            return default
+
+    def add_oos_observation(
+        self,
+        *,
+        strategy_version: str,
+        kind: str,
+        effective_at: str,
+        source_published_at: str,
+        source_kind: str,
+        source_url: str,
+        payload: dict[str, Any],
+        symbol: str = "",
+        captured_at: str = "",
+    ) -> str:
+        """Append one immutable, source-timed production OOS observation."""
+        self._require_available()
+        if not all((strategy_version, kind, effective_at, source_published_at, source_kind)):
+            raise ValueError("OOS observation requires strategy, kind and source times")
+        effective = datetime.fromisoformat(str(effective_at).replace("Z", "+00:00"))
+        published = datetime.fromisoformat(
+            str(source_published_at).replace("Z", "+00:00")
+        )
+        if effective.tzinfo is None or published.tzinfo is None:
+            raise ValueError("OOS observation timestamps must include timezone")
+        if published > effective:
+            raise ValueError("OOS observation source cannot be from the future")
+        payload_json = _json(payload)
+        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        identity = "|".join((
+            strategy_version, kind, symbol, effective.isoformat(), payload_hash,
+        ))
+        observation_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        with self._write_lock, self._connection() as conn:
+            # The first point-in-time observation is the frozen fact.  A later
+            # retry must fill missing symbols, not rewrite already observed
+            # rows with data that changed after the original close.
+            existing = conn.execute(
+                """SELECT id FROM oos_observations
+                   WHERE strategy_version=? AND kind=? AND symbol=?
+                     AND effective_at=?
+                   ORDER BY captured_at,id LIMIT 1""",
+                (strategy_version, kind, symbol, effective.isoformat()),
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
+            conn.execute(
+                """INSERT OR IGNORE INTO oos_observations(
+                    id,strategy_version,kind,symbol,effective_at,source_published_at,
+                    source_kind,source_url,payload_hash,payload_json,captured_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    observation_id, strategy_version, kind, symbol,
+                    effective.isoformat(), published.isoformat(), source_kind,
+                    source_url, payload_hash, payload_json, captured_at or _now(),
+                ),
+            )
+            return observation_id
+
+    def upsert_validation_epoch(self, epoch: Any, *, make_current: bool) -> None:
+        """Persist one epoch and atomically select it as the current owner."""
+        payload = (
+            epoch.model_dump(mode="json")
+            if hasattr(epoch, "model_dump")
+            else dict(epoch)
+        )
+        epoch_id = str(payload["epoch_id"])
+        strategy_version = str(payload["strategy_version"])
+        now = _now()
+        with self._write_lock, self._connection() as conn:
+            if make_current:
+                conn.execute(
+                    "UPDATE validation_epochs SET is_current=0, updated_at=? "
+                    "WHERE strategy_version=? AND is_current=1 AND epoch_id<>?",
+                    (now, strategy_version, epoch_id),
+                )
+            conn.execute(
+                """INSERT INTO validation_epochs(
+                       epoch_id,strategy_version,pool_version,member_hash,
+                       activated_at,status,is_current,epoch_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(epoch_id) DO UPDATE SET
+                       pool_version=excluded.pool_version,
+                       member_hash=excluded.member_hash,
+                       activated_at=excluded.activated_at,
+                       status=excluded.status,
+                       is_current=excluded.is_current,
+                       epoch_json=excluded.epoch_json,
+                       updated_at=excluded.updated_at""",
+                (
+                    epoch_id,
+                    strategy_version,
+                    str(payload["pool_version"]),
+                    str(payload["member_hash"]),
+                    str(payload["activated_at"]),
+                    str(payload.get("status") or "collecting"),
+                    int(make_current),
+                    _json(payload),
+                    now,
+                    now,
+                ),
+            )
+
+    def current_validation_epoch(
+        self, *, strategy_version: str = "cloud_ai_topdown_4321_intraday_v1"
+    ) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM validation_epochs
+                   WHERE strategy_version=? AND is_current=1
+                   ORDER BY activated_at DESC LIMIT 1""",
+                (strategy_version,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["epoch"] = json.loads(result.pop("epoch_json"))
+        result["is_current"] = bool(result["is_current"])
+        return result
+
+    def list_validation_epochs(
+        self,
+        *,
+        strategy_version: str = "cloud_ai_topdown_4321_intraday_v1",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM validation_epochs WHERE strategy_version=?
+                   ORDER BY activated_at DESC LIMIT ?""",
+                (strategy_version, int(limit)),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["epoch"] = json.loads(item.pop("epoch_json"))
+            item["is_current"] = bool(item["is_current"])
+            result.append(item)
+        return result
+
+    def list_oos_observations(
+        self,
+        *,
+        strategy_version: str = "",
+        kind: str = "",
+        symbol: str = "",
+        since: str = "",
+        limit: int = 10_000,
+        descending: bool = False,
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        filters: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("strategy_version", strategy_version), ("kind", kind), ("symbol", symbol),
+        ):
+            if value:
+                filters.append(f"{column}=?")
+                params.append(value)
+        if since:
+            filters.append("effective_at>=?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self._connection() as conn:
+            order = "DESC" if descending else "ASC"
+            rows = conn.execute(
+                f"""SELECT * FROM oos_observations {where}
+                    ORDER BY effective_at {order},kind,symbol LIMIT ?""",
+                (*params, limit),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            result.append(item)
+        return result
+
+    def oos_observation_coverage(self, *, strategy_version: str) -> dict[str, Any]:
+        self._require_available()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT kind,COUNT(*) AS record_count,
+                          COUNT(DISTINCT CASE WHEN symbol<>'' THEN symbol END) AS symbols,
+                          MIN(effective_at) AS period_start,MAX(effective_at) AS period_end
+                   FROM oos_observations WHERE strategy_version=? GROUP BY kind""",
+                (strategy_version,),
+            ).fetchall()
+            constituent_row = conn.execute(
+                """SELECT payload_json FROM oos_observations
+                   WHERE strategy_version=? AND kind='historical_constituents'
+                   ORDER BY effective_at DESC LIMIT 1""",
+                (strategy_version,),
+            ).fetchone()
+        coverage = {
+            str(row["kind"]): {
+                "record_count": int(row["record_count"]),
+                "symbols": int(row["symbols"]),
+                "period_start": str(row["period_start"] or ""),
+                "period_end": str(row["period_end"] or ""),
+            }
+            for row in rows
+        }
+        if constituent_row is not None and "historical_constituents" in coverage:
+            payload = json.loads(str(constituent_row["payload_json"] or "{}"))
+            coverage["historical_constituents"]["symbols"] = len(
+                set(str(item) for item in payload.get("symbols") or [])
+            )
+        return coverage
 
     def upsert_universe_snapshot(
         self,
@@ -426,10 +1198,45 @@ class TradeStore:
     ) -> str:
         self._require_available()
         payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+        symbols = [str(item) for item in payload.get("symbols") or []]
+        symbols.extend(
+            str(item.get("symbol") or "")
+            for item in payload.get("members") or []
+            if isinstance(item, dict)
+        )
+        invalid = sorted({
+            symbol.strip()
+            for symbol in symbols
+            if not is_a_share_stock_symbol(symbol)
+        })
+        if invalid:
+            raise ValueError(
+                "交易股票池仅允许A股股票，拒绝保存非A股或非股票标的: "
+                + ", ".join(invalid)
+            )
         version = str(payload.get("version", ""))
         if not version:
             raise ValueError("universe version is required")
         with self._write_lock, self._connection() as conn:
+            existing = conn.execute(
+                "SELECT snapshot_json FROM universe_snapshots WHERE version=?",
+                (version,),
+            ).fetchone()
+            if existing is not None:
+                existing_payload = json.loads(existing["snapshot_json"] or "{}")
+                managed_kinds = {"user_managed_a_share_universe"}
+                if (
+                    existing_payload != payload
+                    and (
+                        str(existing_payload.get("source_kind") or "") in managed_kinds
+                        or str(payload.get("source_kind") or "") in managed_kinds
+                    )
+                ):
+                    raise ValueError(
+                        "版本化私人股票池快照不可原地覆盖，请生成新的股票池版本"
+                    )
             conn.execute(
                 """INSERT INTO universe_snapshots(
                     version,as_of,source_updated_at,data_complete,snapshot_json,created_at
@@ -571,10 +1378,45 @@ class TradeStore:
             result.append(item)
         return result
 
-    def latest_topdown_score(self, symbol: str = "") -> dict[str, Any] | None:
+    def get_validation_run(self, run_id: str) -> dict[str, Any] | None:
+        """Return one exact validation run used by a strategy transition."""
         self._require_available()
-        where = "WHERE symbol=?" if symbol else ""
-        params: tuple[Any, ...] = (symbol,) if symbol else ()
+        if not run_id:
+            return None
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM strategy_validation_runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["promotion_eligible"] = bool(item["promotion_eligible"])
+        item["report"] = json.loads(item.pop("report_json") or "{}")
+        return item
+
+    def latest_topdown_score(
+        self,
+        symbol: str = "",
+        *,
+        strategy_version: str = "",
+        scoring_version: str = "",
+        pool_version: str = "",
+    ) -> dict[str, Any] | None:
+        self._require_available()
+        filters: list[str] = []
+        params_list: list[Any] = []
+        for column, value in (
+            ("symbol", symbol),
+            ("strategy_version", strategy_version),
+            ("scoring_version", scoring_version),
+            ("pool_version", pool_version),
+        ):
+            if value:
+                filters.append(f"{column}=?")
+                params_list.append(value)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params = tuple(params_list)
         with self._connection() as conn:
             row = conn.execute(
                 f"""SELECT * FROM topdown_score_snapshots {where}
@@ -587,10 +1429,27 @@ class TradeStore:
         result["snapshot"] = json.loads(result.pop("snapshot_json") or "{}")
         return result
 
-    def list_topdown_scores(self, *, symbol: str = "", limit: int = 500) -> list[dict[str, Any]]:
+    def list_topdown_scores(
+        self,
+        *,
+        symbol: str = "",
+        strategy_version: str = "",
+        scoring_version: str = "",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
         self._require_available()
-        where = "WHERE symbol=?" if symbol else ""
-        params: tuple[Any, ...] = (symbol, limit) if symbol else (limit,)
+        filters: list[str] = []
+        params_list: list[Any] = []
+        for column, value in (
+            ("symbol", symbol),
+            ("strategy_version", strategy_version),
+            ("scoring_version", scoring_version),
+        ):
+            if value:
+                filters.append(f"{column}=?")
+                params_list.append(value)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params = (*params_list, limit)
         with self._connection() as conn:
             rows = conn.execute(
                 f"""SELECT * FROM topdown_score_snapshots {where}
@@ -601,6 +1460,201 @@ class TradeStore:
         for row in rows:
             item = dict(row)
             item["snapshot"] = json.loads(item.pop("snapshot_json") or "{}")
+            result.append(item)
+        return result
+
+    def upsert_stock_sandbox(self, snapshot: Any) -> dict[str, Any] | None:
+        """Persist one symbol's latest independent state and return its prior state."""
+        self._require_available()
+        payload = (
+            snapshot.model_dump(mode="json")
+            if hasattr(snapshot, "model_dump")
+            else dict(snapshot)
+        )
+        symbol = str(payload.get("symbol") or "")
+        pool_version = str(payload.get("pool_version") or "")
+        if not symbol or not pool_version:
+            raise ValueError("stock sandbox requires symbol and pool_version")
+        now = _now()
+        with self._write_lock, self._connection() as conn:
+            previous = conn.execute(
+                """SELECT snapshot_json FROM stock_sandbox_current
+                   WHERE symbol=? AND pool_version=?""",
+                (symbol, pool_version),
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO stock_sandbox_current(
+                    symbol,pool_version,observed_at,state,input_hash,snapshot_json,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol,pool_version) DO UPDATE SET
+                    observed_at=excluded.observed_at,
+                    state=excluded.state,
+                    input_hash=excluded.input_hash,
+                    snapshot_json=excluded.snapshot_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    symbol,
+                    pool_version,
+                    str(payload.get("observed_at") or now),
+                    str(payload.get("state") or ""),
+                    str(payload.get("input_hash") or ""),
+                    _json(payload),
+                    now,
+                    now,
+                ),
+            )
+        return json.loads(previous[0]) if previous else None
+
+    def list_stock_sandboxes(
+        self, *, pool_version: str = "", limit: int = 500
+    ) -> list[dict[str, Any]]:
+        self._require_available()
+        where = "WHERE pool_version=?" if pool_version else ""
+        params: tuple[Any, ...] = (
+            (pool_version, limit) if pool_version else (limit,)
+        )
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM stock_sandbox_current {where}
+                    ORDER BY updated_at DESC,symbol ASC LIMIT ?""",
+                params,
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = json.loads(item.pop("snapshot_json") or "{}")
+            result.append(item)
+        return result
+
+    def claim_quant_notification(
+        self,
+        *,
+        event_key: str,
+        symbol: str,
+        event_type: str,
+        bar_closed_at: str = "",
+        plan_id: str = "",
+        details: dict[str, Any] | None = None,
+        retry_failed: bool = False,
+        max_attempts: int = 1,
+        retry_after_seconds: int = 60,
+        recover_pending_after_seconds: int = 300,
+    ) -> bool:
+        """Atomically claim or recover a bounded notification attempt.
+
+        Delivered events are immutable.  Failed events may be retried only
+        when explicitly requested, after a backoff and up to ``max_attempts``.
+        A stale pending row can be reclaimed after a longer timeout so an app
+        crash between claim and completion does not suppress the alert forever.
+        """
+        self._require_available()
+        if not event_key:
+            raise ValueError("notification event_key is required")
+        now = _now()
+        initial_details = {**(details or {}), "attempt_count": 1}
+        with self._write_lock, self._connection() as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO quant_notification_events(
+                    event_key,symbol,event_type,bar_closed_at,plan_id,status,
+                    details_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_key,
+                    symbol,
+                    event_type,
+                    bar_closed_at,
+                    plan_id,
+                    "pending",
+                    _json(initial_details),
+                    now,
+                    now,
+                ),
+            )
+            if cursor.rowcount > 0:
+                return True
+            if not retry_failed or max_attempts <= 1:
+                return False
+            row = conn.execute(
+                """SELECT status,details_json,updated_at
+                   FROM quant_notification_events WHERE event_key=?""",
+                (event_key,),
+            ).fetchone()
+            if row is None or str(row["status"]) == "delivered":
+                return False
+            existing = json.loads(row["details_json"] or "{}")
+            attempts = max(1, int(existing.get("attempt_count") or 1))
+            if attempts >= max(1, int(max_attempts)):
+                return False
+            try:
+                updated_at = datetime.fromisoformat(str(row["updated_at"]))
+                current = datetime.fromisoformat(now)
+            except ValueError:
+                return False
+            status = str(row["status"])
+            retry_delay = (
+                max(0, int(recover_pending_after_seconds))
+                if status == "pending"
+                else max(0, int(retry_after_seconds))
+            )
+            if status not in {"failed", "pending"}:
+                return False
+            if current < updated_at + timedelta(seconds=retry_delay):
+                return False
+            retry_details = {
+                **existing,
+                **(details or {}),
+                "attempt_count": attempts + 1,
+                "retry_started_at": now,
+            }
+            retry = conn.execute(
+                """UPDATE quant_notification_events
+                   SET status='pending',details_json=?,updated_at=?
+                   WHERE event_key=? AND status=? AND updated_at=?""",
+                (
+                    _json(retry_details),
+                    now,
+                    event_key,
+                    status,
+                    str(row["updated_at"]),
+                ),
+            )
+            return retry.rowcount > 0
+
+    def finish_quant_notification(
+        self, event_key: str, *, delivered: bool, details: dict[str, Any] | None = None
+    ) -> None:
+        self._require_available()
+        with self._write_lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT details_json FROM quant_notification_events WHERE event_key=?",
+                (event_key,),
+            ).fetchone()
+            existing = json.loads(row["details_json"] or "{}") if row else {}
+            merged = {**existing, **(details or {})}
+            conn.execute(
+                """UPDATE quant_notification_events
+                   SET status=?,details_json=?,updated_at=? WHERE event_key=?""",
+                (
+                    "delivered" if delivered else "failed",
+                    _json(merged),
+                    _now(),
+                    event_key,
+                ),
+            )
+
+    def list_quant_notifications(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        self._require_available()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM quant_notification_events
+                   ORDER BY created_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item.pop("details_json") or "{}")
             result.append(item)
         return result
 
@@ -642,6 +1696,55 @@ class TradeStore:
                 (symbol,),
             ).fetchone()
         if not row:
+            return None
+        result = dict(row)
+        result["snapshot"] = json.loads(result.pop("snapshot_json") or "{}")
+        return result
+
+    def add_stock_selection_snapshot(self, snapshot: Any) -> str:
+        """Persist one deterministic discovery scan without creating trade facts."""
+        self._require_available()
+        payload = snapshot.model_dump(mode="json") if hasattr(snapshot, "model_dump") else dict(snapshot)
+        snapshot_id = uuid.uuid4().hex
+        with self._write_lock, self._connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO stock_selection_snapshots(
+                    id,strategy_version,generated_at,status,input_hash,snapshot_json,created_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id,
+                    str(payload.get("strategy_version") or ""),
+                    str(payload.get("generated_at") or ""),
+                    str(payload.get("status") or ""),
+                    str(payload.get("input_hash") or ""),
+                    _json(payload),
+                    _now(),
+                ),
+            )
+            row = conn.execute(
+                """SELECT id FROM stock_selection_snapshots
+                   WHERE strategy_version=? AND generated_at=? AND input_hash=?""",
+                (
+                    str(payload.get("strategy_version") or ""),
+                    str(payload.get("generated_at") or ""),
+                    str(payload.get("input_hash") or ""),
+                ),
+            ).fetchone()
+        return str(row[0])
+
+    def latest_stock_selection_snapshot(
+        self, strategy_version: str = ""
+    ) -> dict[str, Any] | None:
+        self._require_available()
+        where = "WHERE strategy_version=?" if strategy_version else ""
+        params = (strategy_version,) if strategy_version else ()
+        with self._connection() as conn:
+            row = conn.execute(
+                f"""SELECT * FROM stock_selection_snapshots {where}
+                    ORDER BY generated_at DESC,created_at DESC LIMIT 1""",
+                params,
+            ).fetchone()
+        if row is None:
             return None
         result = dict(row)
         result["snapshot"] = json.loads(result.pop("snapshot_json") or "{}")
@@ -764,6 +1867,126 @@ class TradeStore:
                 (safe_limit,),
             ).fetchall()
         return [str(row[0]) for row in rows]
+
+    def market_daily_history_for_symbols(
+        self,
+        symbols: set[str],
+        *,
+        before_as_of: str,
+        limit_sessions: int,
+    ) -> dict[str, list[float]]:
+        """Return real closes for the latest explicit sessions before a date."""
+        self._require_available()
+        clean_symbols = sorted({str(value) for value in symbols if str(value)})
+        required = max(1, int(limit_sessions))
+        if not clean_symbols:
+            return {}
+        with self._connection() as conn:
+            dates = [
+                str(row[0])
+                for row in conn.execute(
+                    """SELECT DISTINCT as_of FROM market_daily_prices
+                       WHERE as_of<? ORDER BY as_of DESC LIMIT ?""",
+                    (str(before_as_of)[:10], required),
+                ).fetchall()
+            ]
+            if len(dates) != required:
+                return {}
+            date_placeholders = ",".join("?" for _ in dates)
+            symbol_placeholders = ",".join("?" for _ in clean_symbols)
+            rows = conn.execute(
+                f"""SELECT symbol,as_of,price FROM market_daily_prices
+                    WHERE as_of IN ({date_placeholders})
+                      AND symbol IN ({symbol_placeholders})
+                    ORDER BY symbol,as_of""",
+                (*dates, *clean_symbols),
+            ).fetchall()
+        result: dict[str, list[float]] = {}
+        for row in rows:
+            result.setdefault(str(row[0]), []).append(float(row[2]))
+        return result
+
+    def upsert_market_daily_price_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        captured_at: str,
+    ) -> int:
+        """Persist verified historical closes without manufacturing missing days."""
+        self._require_available()
+        clean: dict[tuple[str, str], float] = {}
+        for item in rows:
+            as_of = str(item.get("as_of") or "")[:10]
+            symbol = str(item.get("symbol") or "")
+            price = item.get("price")
+            if (
+                len(as_of) == 10
+                and symbol.isdigit()
+                and len(symbol) == 6
+                and price is not None
+                and float(price) > 0
+            ):
+                clean[(as_of, symbol)] = float(price)
+        if not clean:
+            return 0
+        with self._write_lock, self._connection() as conn:
+            conn.executemany(
+                """INSERT INTO market_daily_prices(as_of,symbol,price,captured_at)
+                   VALUES(?,?,?,?) ON CONFLICT(as_of,symbol) DO UPDATE SET
+                   price=excluded.price,captured_at=excluded.captured_at""",
+                [
+                    (as_of, symbol, price, captured_at)
+                    for (as_of, symbol), price in clean.items()
+                ],
+            )
+        return len(clean)
+
+    def complete_market_history_symbols(
+        self,
+        symbols: set[str],
+        *,
+        session_dates: list[str],
+    ) -> set[str]:
+        """Return symbols already covering every requested closed session."""
+        self._require_available()
+        if not symbols or not session_dates:
+            return set()
+        first, last = min(session_dates), max(session_dates)
+        required = len(set(session_dates))
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT symbol,COUNT(DISTINCT as_of) AS sessions
+                   FROM market_daily_prices
+                   WHERE as_of>=? AND as_of<=?
+                   GROUP BY symbol HAVING sessions>=?""",
+                (first, last, required),
+            ).fetchall()
+        return {str(row[0]) for row in rows if str(row[0]) in symbols}
+
+    def market_daily_price_coverage(
+        self,
+        *,
+        session_dates: list[str],
+    ) -> dict[str, int]:
+        """Count distinct real symbols for each explicitly requested session."""
+        self._require_available()
+        dates = list(dict.fromkeys(str(value)[:10] for value in session_dates if value))
+        if not dates:
+            return {}
+        result = {value: 0 for value in dates}
+        for offset in range(0, len(dates), 400):
+            batch = dates[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            with self._connection() as conn:
+                rows = conn.execute(
+                    f"""SELECT as_of,COUNT(DISTINCT symbol)
+                        FROM market_daily_prices
+                        WHERE as_of IN ({placeholders}) GROUP BY as_of""",
+                    tuple(batch),
+                ).fetchall()
+            for row in rows:
+                result[str(row[0])] = int(row[1])
+        return result
 
     def add_outside_pool_approval(
         self,
@@ -1293,8 +2516,16 @@ class TradeStore:
             result.append(item)
         return result
 
-    def link_broker_order(self, reconciliation: Any, *, details: dict[str, Any] | None = None) -> str:
+    def link_broker_order(
+        self,
+        reconciliation: Any,
+        *,
+        account_fingerprint: str,
+        details: dict[str, Any] | None = None,
+    ) -> str:
         self._require_available()
+        if not account_fingerprint:
+            raise ValueError("broker order link requires account fingerprint")
         payload = reconciliation.model_dump(mode="json") if hasattr(reconciliation, "model_dump") else dict(reconciliation)
         orders = list(payload.get("matched_order_ids") or [])
         if len(orders) != 1:
@@ -1303,28 +2534,38 @@ class TradeStore:
         with self._write_lock, self._connection() as conn:
             conn.execute(
                 """INSERT INTO broker_order_links(
-                    id,plan_id,broker_order_id,broker_fill_ids_json,match_status,details_json,
-                    created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?)
-                ON CONFLICT(plan_id,broker_order_id) DO UPDATE SET
+                    id,account_fingerprint,plan_id,broker_order_id,broker_fill_ids_json,
+                    match_status,details_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(account_fingerprint,plan_id,broker_order_id) DO UPDATE SET
                     broker_fill_ids_json=excluded.broker_fill_ids_json,
                     match_status=excluded.match_status,details_json=excluded.details_json,
                     updated_at=excluded.updated_at""",
                 (
-                    link_id, str(payload.get("plan_id", "")), orders[0],
+                    link_id, account_fingerprint, str(payload.get("plan_id", "")), orders[0],
                     _json(payload.get("matched_fill_ids", [])), str(payload.get("status", "")),
-                    _json(details or {}), _now(), _now(),
+                    _json({**(details or {}), "account_fingerprint": account_fingerprint}),
+                    _now(), _now(),
                 ),
             )
         return link_id
 
-    def list_broker_order_links(self) -> list[dict[str, Any]]:
+    def list_broker_order_links(
+        self, *, account_fingerprint: str = ""
+    ) -> list[dict[str, Any]]:
         """Return decoded broker links used to prevent duplicate/manual fill attribution."""
         self._require_available()
         with self._connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM broker_order_links ORDER BY updated_at DESC"
-            ).fetchall()
+            if account_fingerprint:
+                rows = conn.execute(
+                    "SELECT * FROM broker_order_links WHERE account_fingerprint=? "
+                    "ORDER BY updated_at DESC",
+                    (account_fingerprint,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM broker_order_links ORDER BY updated_at DESC"
+                ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
@@ -1333,10 +2574,14 @@ class TradeStore:
             result.append(item)
         return result
 
-    def linked_broker_fill_ids(self) -> set[str]:
+    def linked_broker_fill_ids(
+        self, *, account_fingerprint: str = ""
+    ) -> set[str]:
         return {
             str(fill_id)
-            for link in self.list_broker_order_links()
+            for link in self.list_broker_order_links(
+                account_fingerprint=account_fingerprint
+            )
             for fill_id in link.get("broker_fill_ids", [])
             if fill_id
         }
@@ -1348,14 +2593,21 @@ class TradeStore:
         fill_id = str(payload.get("broker_fill_id", ""))
         if not fill_id:
             raise ValueError("external broker fill id is required")
+        if not account_fingerprint:
+            raise ValueError("external broker account fingerprint is required")
+        identity = hashlib.sha256(
+            f"{account_fingerprint}|{fill_id}".encode("utf-8")
+        ).hexdigest()
         with self._write_lock, self._connection() as conn:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO external_broker_trades(
-                    broker_fill_id,account_fingerprint,broker_order_id,symbol,direction,price,
-                    quantity,fees,filled_at,fill_json,first_seen_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    identity,broker_fill_id,account_fingerprint,broker_order_id,
+                    symbol,direction,price,quantity,fees,filled_at,fill_json,
+                    first_seen_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    fill_id, account_fingerprint, str(payload.get("broker_order_id", "")),
+                    identity, fill_id, account_fingerprint,
+                    str(payload.get("broker_order_id", "")),
                     str(payload.get("symbol", "")), str(payload.get("direction", "")),
                     float(payload.get("price") or 0), int(payload.get("quantity") or 0),
                     float(payload.get("fees") or 0), str(payload.get("filled_at", "")),
@@ -1380,9 +2632,12 @@ class TradeStore:
         plan_status: str,
         event_type: str,
         broker_order_id: str,
+        account_fingerprint: str,
     ) -> None:
         """Apply real broker fills idempotently; broker data remains the source of truth."""
         self._require_available()
+        if not account_fingerprint:
+            raise ValueError("broker execution requires account fingerprint")
         payloads = [
             item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
             for item in fills
@@ -1401,17 +2656,26 @@ class TradeStore:
             plan = conn.execute("SELECT id FROM trade_plans WHERE id=?", (plan_id,)).fetchone()
             if plan is None:
                 raise ValueError("trade plan not found")
+            link = conn.execute(
+                """SELECT id FROM broker_order_links
+                   WHERE account_fingerprint=? AND plan_id=? AND broker_order_id=?""",
+                (account_fingerprint, plan_id, broker_order_id),
+            ).fetchone()
+            if link is None:
+                raise ValueError("broker execution does not match an account-scoped order link")
             if quantity > 0:
                 average_price = total_value / quantity
                 conn.execute(
                     """INSERT INTO executions(
-                        id,plan_id,executed_at,price,quantity,real_contract,fees,note,created_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                        id,plan_id,executed_at,price,quantity,real_contract,fees,
+                        account_fingerprint,note,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET executed_at=excluded.executed_at,
                         price=excluded.price,quantity=excluded.quantity,fees=excluded.fees,
-                        note=excluded.note""",
+                        account_fingerprint=excluded.account_fingerprint,note=excluded.note""",
                     (
                         execution_id, plan_id, executed_at, average_price, quantity, "", fees,
+                        account_fingerprint,
                         f"同花顺真实成交；委托 {broker_order_id}", _now(),
                     ),
                 )
@@ -1426,6 +2690,7 @@ class TradeStore:
             ).fetchone()
             details = {
                 "broker_order_id": broker_order_id,
+                "account_fingerprint": account_fingerprint,
                 "broker_fill_ids": [item.get("broker_fill_id") for item in payloads],
                 "quantity": quantity,
                 "fees": fees,

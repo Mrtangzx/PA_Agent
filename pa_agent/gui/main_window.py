@@ -6,7 +6,14 @@ import sys
 from typing import Any
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut, QShowEvent
+from PyQt6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QGuiApplication,
+    QKeySequence,
+    QShortcut,
+    QShowEvent,
+)
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -35,6 +42,18 @@ logger = logging.getLogger(__name__)
 
 # Zombie timeout in milliseconds (5 seconds)
 _WORKER_JOIN_TIMEOUT_MS = 5000
+
+
+def _bounded_initial_window_size(
+    available_width: int, available_height: int
+) -> tuple[int, int]:
+    """Keep the initial window inside the usable screen at any DPI scale."""
+    horizontal_margin = 24
+    vertical_margin = 48
+    return (
+        min(1440, max(1, available_width - horizontal_margin)),
+        min(900, max(1, available_height - vertical_margin)),
+    )
 
 
 def _qobject_alive(obj: QObject | None) -> bool:
@@ -222,7 +241,7 @@ class _AnalysisWorker(QThread):
             )
             decision = record.stage2_decision or {}
         except Exception as exc:  # noqa: BLE001
-            from pa_agent.ai.deepseek_client import CancelledError as _CancelledError
+            from pa_agent.ai.model_types import CancelledError as _CancelledError
             if isinstance(exc, _CancelledError):
                 logger.info("Analysis worker cancelled: %s", exc)
                 decision = {}
@@ -248,7 +267,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             "PA Agent — Trading Terminal（分析仅供参考，不构成投资建议）"
         )
-        self.resize(1440, 900)
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(1440, 900)
+        else:
+            available = screen.availableGeometry()
+            self.resize(*_bounded_initial_window_size(
+                available.width(), available.height()
+            ))
         self._ctx = ctx
         if self._ctx.settings is None:
             from pa_agent.config.settings import Settings
@@ -303,6 +329,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._setup_ui()
         self._connect_event_bus()
+        self._connect_quant_runtime()
         self._update_ai_mode_label()
         self._sync_submit_button_state()
 
@@ -342,9 +369,28 @@ class MainWindow(QMainWindow):
         self._analysis_page = self._build_workbench()
         self._page_stack = QStackedWidget()
         self._page_stack.setObjectName("mainContentStack")
+        # Wide trading tables keep their own horizontal scrollbars.  They must
+        # not inflate the top-level window beyond the usable desktop width.
+        self._page_stack.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
         self._page_stack.addWidget(self._analysis_page)
+        # The deterministic stock-pool workbench is the default operating
+        # surface.  The chart/Codex page remains available as an isolated
+        # research tool and cannot authorize a quant order.
+        trade_store = getattr(self._ctx, "trade_store", None)
+        if trade_store is not None and getattr(trade_store, "available", False):
+            from pa_agent.gui.quant_workbench import QuantWorkbenchPage
+
+            self._trade_ledger_window = QuantWorkbenchPage(self._ctx, self._page_stack)
+            self._trade_ledger_window.return_to_analysis_requested.connect(
+                self._show_analysis_page
+            )
+            self._page_stack.addWidget(self._trade_ledger_window)
         self._central = self._page_stack
         self.setCentralWidget(self._page_stack)
+        if self._trade_ledger_window is not None:
+            self._page_stack.setCurrentWidget(self._trade_ledger_window)
 
         # ── Status bar ────────────────────────────────────────────────────────
         self._status_bar = QStatusBar()
@@ -376,32 +422,65 @@ class MainWindow(QMainWindow):
             self._status_bar.addPermanentWidget(self._broker_status)
         self._refresh_api_key_ui_state()
 
-        # ── Menu bar ─── 顶层直接触发按钮 + 演示模式下拉 ────────────────────
+        # ── Menu bar ────────────────────────────────────────────────────────
         menu_bar: QMenuBar = self.menuBar()  # type: ignore[assignment]
         # macOS 原生菜单栏只认 QMenu 下拉菜单，不认顶层 QAction，
         # 强制禁用原生菜单栏以保持跨平台一致的按钮式菜单栏体验。
         if sys.platform == "darwin":
             menu_bar.setNativeMenuBar(False)
 
-        # 1. AI 模型设置 — 点击直接弹对话框（无下拉）
-        _ai_model_action = QAction("AI 模型设置", self)
-        _ai_model_action.triggered.connect(self._open_ai_model_settings_dialog)
-        menu_bar.addAction(_ai_model_action)
+        # Keep configuration out of the primary operating navigation.  The
+        # submenu is also the single extension point for future system-level
+        # preferences.
+        self._system_settings_menu = menu_bar.addMenu("系统设置")
+        self._system_settings_menu.setObjectName("systemSettingsMenu")
 
-        # 2. 飞书发送通知设置 — 点击直接弹对话框（无下拉）
-        _feishu_action = QAction("飞书发送通知设置", self)
-        _feishu_action.triggered.connect(self._open_feishu_settings_dialog)
-        menu_bar.addAction(_feishu_action)
+        self._ai_model_settings_action = QAction("AI 模型设置", self)
+        self._ai_model_settings_action.setObjectName("aiModelSettingsAction")
+        self._ai_model_settings_action.triggered.connect(
+            self._open_ai_model_settings_dialog
+        )
+        self._system_settings_menu.addAction(self._ai_model_settings_action)
 
-        # 3. 其他通用设置 — 点击直接弹对话框（无下拉）
-        _general_action = QAction("其他通用设置", self)
-        _general_action.triggered.connect(self._open_general_settings_dialog)
-        menu_bar.addAction(_general_action)
+        self._feishu_settings_action = QAction("飞书发送通知设置", self)
+        self._feishu_settings_action.setObjectName("feishuSettingsAction")
+        self._feishu_settings_action.triggered.connect(
+            self._open_feishu_settings_dialog
+        )
+        self._system_settings_menu.addAction(self._feishu_settings_action)
 
-        self._trade_management_action = QAction("交易管理", self)
-        self._trade_management_action.setToolTip("在当前窗口打开量化交易工作台")
+        self._system_settings_menu.addSeparator()
+        self._general_settings_action = QAction("其他通用设置", self)
+        self._general_settings_action.setObjectName("generalSettingsAction")
+        self._general_settings_action.triggered.connect(
+            self._open_general_settings_dialog
+        )
+        self._system_settings_menu.addAction(self._general_settings_action)
+
+        self._trade_management_action = QAction("实时监控", self)
+        self._trade_management_action.setToolTip("打开股票池驱动的实时量化工作台")
         self._trade_management_action.triggered.connect(self._open_trade_ledger)
         menu_bar.addAction(self._trade_management_action)
+        self._trade_account_action = QAction("交易账户", self)
+        self._trade_account_action.triggered.connect(
+            lambda: self._open_trade_ledger("account")
+        )
+        menu_bar.addAction(self._trade_account_action)
+        self._stock_selection_action = QAction("智能选股", self)
+        self._stock_selection_action.setToolTip("打开确定性A股选股与重大负面过滤")
+        self._stock_selection_action.triggered.connect(
+            lambda: self._open_trade_ledger("selection")
+        )
+        menu_bar.addAction(self._stock_selection_action)
+        self._trade_validation_action = QAction("系统验证", self)
+        self._trade_validation_action.triggered.connect(
+            lambda: self._open_trade_ledger("validation")
+        )
+        menu_bar.addAction(self._trade_validation_action)
+        self._research_action = QAction("研究分析", self)
+        self._research_action.setToolTip("独立K线与Codex研究，不参与量化授权")
+        self._research_action.triggered.connect(self._show_analysis_page)
+        menu_bar.addAction(self._research_action)
         self._trade_management_shortcut = QShortcut(
             QKeySequence("Ctrl+Shift+T"), self
         )
@@ -417,7 +496,7 @@ class MainWindow(QMainWindow):
             self._return_to_analysis_if_needed
         )
 
-        # 4. 演示模式 — 保留下拉菜单
+        # 演示模式保留独立下拉菜单。
         demo_menu = menu_bar.addMenu("演示模式")
         self._demo_manual_action = QAction("手动选择记录…", self)
         self._demo_manual_action.triggered.connect(lambda: self._on_demo_menu_action("manual"))
@@ -445,38 +524,42 @@ class MainWindow(QMainWindow):
         ctrl_layout.setSpacing(8)
 
         _settings = getattr(self._ctx, "settings", None)
-        _last_symbol = "XAUUSDm"
+        _last_symbol = "600519"
         _last_tf = "15m"
         if _settings is not None:
-            _last_symbol = getattr(_settings.general, "last_symbol", "XAUUSDm") or "XAUUSDm"
+            _last_symbol = getattr(_settings.general, "last_symbol", "600519") or "600519"
             _last_tf = getattr(_settings.general, "last_timeframe", "15m") or "15m"
 
         # Data source
-        from pa_agent.data.factory import DATA_SOURCE_CHOICES, normalize_data_source_kind
+        from pa_agent.data.factory import (
+            PRODUCTION_DATA_SOURCE_CHOICES,
+            normalize_data_source_kind,
+        )
 
-        _last_ds = "mt5"
+        _last_ds = "eastmoney"
         if _settings is not None:
             _last_ds = normalize_data_source_kind(
-                getattr(_settings.general, "last_data_source", "mt5")
+                getattr(_settings.general, "last_data_source", "eastmoney")
             )
         # 如果上次保存的数据源不在 UI 可选列表中, 强制回退 MT5
-        _ui_kinds = {k for k, _ in DATA_SOURCE_CHOICES}
+        _ui_kinds = {k for k, _ in PRODUCTION_DATA_SOURCE_CHOICES}
         if _last_ds not in _ui_kinds:
-            _last_ds = "mt5"
+            _last_ds = "eastmoney"
         self._active_data_source_kind = _last_ds
 
         ctrl_layout.addWidget(QLabel("数据来源:"))
         self._data_source_combo = QComboBox()
-        for kind, label in DATA_SOURCE_CHOICES:
+        for kind, label in PRODUCTION_DATA_SOURCE_CHOICES:
             self._data_source_combo.addItem(label, kind)
         ds_index = self._data_source_combo.findData(_last_ds)
         if ds_index >= 0:
             self._data_source_combo.setCurrentIndex(ds_index)
         self._data_source_combo.setMinimumWidth(156)
         self._data_source_combo.setToolTip(
-            "K 线数据来源：MT5（需终端登录）、TradingView（tvDatafeed）、"
-            "A 股（东方财富）、国内期货（AkShare / 新浪行情，无需 MT5）"
+            "当前生产范围仅限A股，行情统一使用东方财富；"
+            "其他市场数据源已从生产界面关闭"
         )
+        self._data_source_combo.setEnabled(False)
         self._data_source_combo.currentIndexChanged.connect(
             self._on_data_source_combo_changed
         )
@@ -555,7 +638,7 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self._variety_combo)
 
         # 合约/品种 — editable combo (user can type any symbol)
-        self._symbol_label = QLabel("合约:")
+        self._symbol_label = QLabel("股票:")
         ctrl_layout.addWidget(self._symbol_label)
         self._symbol_combo = QComboBox()
         self._symbol_combo.setEditable(True)
@@ -623,7 +706,7 @@ class MainWindow(QMainWindow):
         self._incremental_submit_btn.clicked.connect(self._on_submit_incremental_analysis)
         self._incremental_submit_btn.hide()
 
-        # 演示模式按钮已移至左上角「设置」菜单，此处保留引用供内部逻辑使用（不加入 ctrl_layout）
+        # 演示模式按钮已移至菜单栏，此处保留引用供内部逻辑使用（不加入 ctrl_layout）
         self._demo_btn = QPushButton("演示模式")
         self._demo_btn.setToolTip("用 records/pending 中已保存的分析记录回放界面")
         self._demo_btn.clicked.connect(self._on_demo_mode_button)
@@ -671,7 +754,7 @@ class MainWindow(QMainWindow):
         outer_layout.addLayout(ctrl_layout)
 
         self._api_key_alert_label = QLabel(
-            "未配置可用的 AI 凭据：请点击左上角「AI 模型」，填写 API Key，"
+            "未配置可用的 AI 凭据：请打开「系统设置 → AI 模型设置」，填写 API Key，"
             "或选择使用本机登录状态的 Codex SDK。"
         )
         self._api_key_alert_label.setWordWrap(True)
@@ -765,6 +848,44 @@ class MainWindow(QMainWindow):
         if bus is None:
             return
         bus.status.connect(self._on_status_update)
+
+    def _connect_quant_runtime(self) -> None:
+        """Keep the home-page full-pool monitor live without opening trading UI."""
+        runtime = getattr(self._ctx, "quant_runtime", None)
+        monitor = getattr(self, "_stock_pool_monitor", None)
+        if runtime is None or monitor is None:
+            return
+        runtime.updated.connect(monitor.refresh)
+        runtime.status_changed.connect(monitor.set_runtime_status)
+        runtime.task_failed.connect(monitor.set_runtime_status)
+
+    def _refresh_full_stock_pool(self) -> None:
+        """Refresh all deterministic pool inputs; never invokes an LLM or order UI."""
+        runtime = getattr(self._ctx, "quant_runtime", None)
+        monitor = getattr(self, "_stock_pool_monitor", None)
+        if runtime is None:
+            if monitor is not None:
+                monitor.set_runtime_status("runtime", "量化后台尚未启动")
+            return
+        runtime.ensure_current_universe()
+        runtime.ensure_daily_candidates()
+        runtime.refresh_hotspots()
+        runtime.refresh_topdown_scores()
+        runtime.refresh_stock_sandboxes()
+        if monitor is not None:
+            monitor.set_runtime_status("runtime", "已发起全池刷新，后台持续跟踪中")
+
+    def _select_stock_pool_symbol(self, symbol: str) -> None:
+        """Switch the visible chart to a monitored pool stock, without AI analysis."""
+        if not self._is_valid_production_stock(symbol):
+            return
+        self._symbol_combo.setCurrentText(symbol)
+        self._tf_combo.setCurrentText("15m")
+        self._on_fetch_data_clicked()
+        self._status_bar.showMessage(
+            f"已从股票池切换到 {symbol} 15m；全池量化监控仍在后台持续运行",
+            5000,
+        )
 
     def _start_refresh_loop(self) -> None:
         """Start the RefreshLoop only when the data source is connected."""
@@ -1015,7 +1136,34 @@ class MainWindow(QMainWindow):
             logger.debug("disconnect failed: %s", exc)
 
     def _current_data_source_kind(self) -> str:
-        return getattr(self, "_active_data_source_kind", "mt5")
+        return getattr(self, "_active_data_source_kind", "eastmoney")
+
+    def _is_valid_production_stock(self, symbol: str | None = None) -> bool:
+        """Validate the fixed A-share-only production analysis boundary."""
+        from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+        value = (
+            symbol
+            if symbol is not None
+            else self._symbol_combo.currentText().strip()
+        )
+        return (
+            self._current_data_source_kind() == "eastmoney"
+            and is_a_share_stock_symbol(value)
+        )
+
+    def _show_a_share_scope_block(self, symbol: str) -> None:
+        message = (
+            f"{symbol or '当前输入'}不属于可分析的A股股票代码；"
+            "请输入6位A股代码，例如600519。指数、基金、债券、期货、外汇、"
+            "港美股和数字货币暂不开放。"
+        )
+        self._status_bar.showMessage(message, 10_000)
+        label = getattr(self, "_symbol_alert_label", None)
+        if label is not None:
+            label.setText(message)
+            label.setStyleSheet("color: #f85149; font-size: 11px;")
+            label.show()
 
     def _tv_exchange_text(self) -> str:
         combo = getattr(self, "_tv_exchange_combo", None)
@@ -1157,7 +1305,7 @@ class MainWindow(QMainWindow):
         is_futures = kind == "eastmoney_futures"
         self._variety_label.setVisible(is_futures)
         self._variety_combo.setVisible(is_futures)
-        self._symbol_label.setText("合约:" if is_futures else "品种:")
+        self._symbol_label.setText("合约:" if is_futures else "股票:")
         if kind == "tradingview":
             line.setPlaceholderText(
                 "A股 6 位 / 港股 1810 / 名称 小米集团；交易所可自动；或 XAUUSD+OANDA"
@@ -1165,7 +1313,7 @@ class MainWindow(QMainWindow):
         elif kind == "eastmoney_futures":
             line.setPlaceholderText("选择左侧品种后在此选合约, 或直接输入如 AO2509")
         elif kind in ("akshare", "eastmoney", "tushare"):
-            line.setPlaceholderText("A股 6 位代码，如 600519；指数 000300 或 sh000300")
+            line.setPlaceholderText("输入6位A股股票代码，如 600519（贵州茅台）")
         else:
             line.setPlaceholderText("输入 MT5 品种名，如 XAUUSDm…")
 
@@ -1189,6 +1337,10 @@ class MainWindow(QMainWindow):
                 symbols = list(data_source.list_symbols())
             except Exception as exc:  # noqa: BLE001
                 logger.debug("list_symbols failed: %s", exc)
+        if kind == "eastmoney":
+            from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+            symbols = [item for item in symbols if is_a_share_stock_symbol(item)]
 
         self._symbol_combo.blockSignals(True)
         self._symbol_combo.clear()
@@ -1354,6 +1506,11 @@ class MainWindow(QMainWindow):
         from pa_agent.config.settings import save_settings
         from pa_agent.data.factory import create_data_source, data_source_label
 
+        if kind != "eastmoney":
+            self._status_bar.showMessage(
+                "当前生产范围仅限A股，数据源已固定为东方财富"
+            )
+            kind = "eastmoney"
         if self._switching:
             return
         self._switching = True
@@ -1486,6 +1643,9 @@ class MainWindow(QMainWindow):
         if not symbol:
             label.hide()
             return
+        if not self._is_valid_production_stock(symbol):
+            self._show_a_share_scope_block(symbol)
+            return
         data_source = getattr(self._ctx, "data_source", None)
         if not getattr(data_source, "_connected", False):
             label.hide()
@@ -1595,6 +1755,10 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_data_clicked(self) -> None:
         """Start (or restart) continuous data refresh for the current symbol/timeframe."""
+        symbol = self._symbol_combo.currentText().strip()
+        if not self._is_valid_production_stock(symbol):
+            self._show_a_share_scope_block(symbol)
+            return
         data_source = getattr(self._ctx, "data_source", None)
         if data_source is None or not getattr(data_source, "_connected", False):
             self._status_bar.showMessage("数据源未连接，请先切换数据来源")
@@ -1957,6 +2121,23 @@ class MainWindow(QMainWindow):
         if self._switching:
             return  # Prevent re-entrant calls
         if getattr(self, "_demo_mode", False):
+            return
+        if not self._is_valid_production_stock(new_symbol):
+            had_analysis = self._analysis_in_progress
+            self._cancel_analysis_worker(join_ms=_WORKER_JOIN_TIMEOUT_MS)
+            if had_analysis:
+                self._analysis_in_progress = False
+                self._update_submit_button_state()
+            self._free_chat_session = None
+            self._disable_chat_input()
+            data_source = getattr(self._ctx, "data_source", None)
+            previous_symbol = str(
+                getattr(data_source, "_symbol", "") or "600519"
+            ).strip()
+            self._symbol_combo.blockSignals(True)
+            self._symbol_combo.setCurrentText(previous_symbol)
+            self._symbol_combo.blockSignals(False)
+            self._show_a_share_scope_block(new_symbol)
             return
 
         self._clear_pending_bar_close_wait()
@@ -2844,7 +3025,7 @@ class MainWindow(QMainWindow):
             self._demo_auto_action.setEnabled(True)
         ds_combo = getattr(self, "_data_source_combo", None)
         if ds_combo is not None:
-            ds_combo.setEnabled(True)
+            ds_combo.setEnabled(False)
         self._sync_tv_exchange_visibility()
         self._demo_mode_label.hide()
         self._analysis_in_progress = False
@@ -2874,6 +3055,10 @@ class MainWindow(QMainWindow):
 
     def _begin_submit_analysis(self, *, force_incremental: bool) -> None:
         """Shared entry for normal and forced-incremental submit buttons."""
+        symbol = self._symbol_combo.currentText().strip()
+        if not self._is_valid_production_stock(symbol):
+            self._show_a_share_scope_block(symbol)
+            return
         if not self._can_submit():
             return
 
@@ -4155,35 +4340,43 @@ class MainWindow(QMainWindow):
             self._current_trade_plan_id = None
             QMessageBox.information(self, "已忽略", "方案已标记忽略；影子结果仍继续用于策略评价。")
 
-    def _open_trade_ledger(self) -> None:
-        from pa_agent.gui.trade_ledger_window import TradeLedgerWindow
-
+    def _open_trade_ledger(self, workspace: str | bool = "monitor") -> None:
+        if isinstance(workspace, bool):
+            workspace = "monitor"
         if self._trade_ledger_window is None:
-            self._trade_ledger_window = TradeLedgerWindow(self._ctx, self._page_stack)
+            from pa_agent.gui.quant_workbench import QuantWorkbenchPage
+
+            self._trade_ledger_window = QuantWorkbenchPage(self._ctx, self._page_stack)
             self._trade_ledger_window.return_to_analysis_requested.connect(
                 self._show_analysis_page
             )
             self._page_stack.addWidget(self._trade_ledger_window)
         self._trade_ledger_window.refresh()
+        if hasattr(self._trade_ledger_window, "navigate"):
+            self._trade_ledger_window.navigate(str(workspace))
         self._page_stack.setCurrentWidget(self._trade_ledger_window)
         action = getattr(self, "_trade_management_action", None)
         if action is not None:
-            action.setText("交易管理 · 当前")
-            action.setToolTip(
-                "量化交易工作台已在当前窗口打开（Esc 返回行情分析）"
-            )
+            action.setText("实时监控")
+            action.setToolTip("量化交易工作台已在当前窗口打开")
         self._status_bar.showMessage(
-            "交易管理工作台 · Esc 返回行情分析 · Ctrl+1～9 切换页面",
+            "股票池量化工作台 · 单窗口实时监控、智能选股、账户与系统验证",
             5000,
         )
 
     def _show_analysis_page(self) -> None:
+        runtime = getattr(self._ctx, "quant_runtime", None)
+        if runtime is not None:
+            runtime.refresh_stock_sandboxes()
         self._page_stack.setCurrentWidget(self._analysis_page)
+        if not self._startup_api_key_check_done:
+            self._startup_api_key_check_done = True
+            QTimer.singleShot(0, self._on_startup_api_key_check)
         action = getattr(self, "_trade_management_action", None)
         if action is not None:
-            action.setText("交易管理")
+            action.setText("实时监控")
             action.setToolTip(
-                "在当前窗口打开量化交易工作台（Ctrl+Shift+T）"
+                "打开股票池驱动的量化工作台（Ctrl+Shift+T）"
             )
         self._status_bar.showMessage("行情与AI分析", 3000)
 
@@ -4378,12 +4571,13 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def showEvent(self, event: QShowEvent | None) -> None:
-        """On first show, prompt for AI credentials when missing."""
+        """Do not make AI credentials a prerequisite for the quant home page."""
         super().showEvent(event)
-        if self._startup_api_key_check_done:
+        if self._page_stack.currentWidget() is not self._analysis_page:
             return
-        self._startup_api_key_check_done = True
-        QTimer.singleShot(0, self._on_startup_api_key_check)
+        if not self._startup_api_key_check_done:
+            self._startup_api_key_check_done = True
+            QTimer.singleShot(0, self._on_startup_api_key_check)
         if not self._startup_tv_connectivity_check_done:
             self._startup_tv_connectivity_check_done = True
             QTimer.singleShot(0, self._on_startup_tv_connectivity_check)
@@ -4505,42 +4699,11 @@ class MainWindow(QMainWindow):
             self._ai_mode_label.setText("")
             return
         p = settings.provider
-        base = (p.base_url or "").lower()
-        if getattr(p, "backend", "openai_compatible") == "codex_sdk":
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "none"
-            self._ai_mode_label.setText(
-                f"Codex Agent · {p.model} · 思考={thinking} · effort={effort} · 只读"
-            )
-        elif "deepseek.com" in base:
-            thinking = "开" if p.thinking else "关"
-            self._ai_mode_label.setText(
-                f"思考: {thinking} · effort={p.reasoning_effort} · {p.model}"
-            )
-        elif "kkone.vip" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            self._ai_mode_label.setText(
-                f"KKAI 思考: {thinking} · budget≈{effort} · {p.model}"
-            )
-        elif "yunwu.ai" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            mode = "adaptive" if "opus-4-7" in p.model or "opus-4-6" in p.model else "effort"
-            self._ai_mode_label.setText(
-                f"云雾 思考: {thinking} · {mode}={effort} · {p.model}"
-            )
-        elif "packyapi.com" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            mode = "adaptive" if "opus-4-7" in p.model or "opus-4-6" in p.model else "effort"
-            self._ai_mode_label.setText(
-                f"PackyAPI 思考: {thinking} · {mode}={effort} · {p.model}"
-            )
-        else:
-            self._ai_mode_label.setText(
-                f"模型: {p.model} · 思考={('开' if p.thinking else '关')}"
-            )
+        thinking = "开" if p.thinking else "关"
+        effort = p.reasoning_effort if p.thinking else "none"
+        self._ai_mode_label.setText(
+            f"Codex SDK · {p.model} · 思考={thinking} · effort={effort} · 本机登录"
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -4551,7 +4714,7 @@ class MainWindow(QMainWindow):
     def _submit_block_reason(self) -> str | None:
         """Human-readable reason when submit is disabled, or None if allowed."""
         if not self._has_api_key_configured():
-            return "未配置 AI 凭据，请填写 API Key，或选择 Codex SDK"
+            return "Codex SDK 不可用，请先确认本机 Codex 已登录"
         if self._demo_mode:
             return "演示模式中，请退出演示后再提交真实分析"
         if self._analysis_in_progress:

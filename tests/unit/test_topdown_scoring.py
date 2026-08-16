@@ -66,6 +66,8 @@ def _theme(*, major_negative: bool = False):
         major_negative=major_negative,
         risk_code="regulatory_investigation" if major_negative else "",
         related_themes=["白酒"],
+        time_valid=True,
+        time_validation_reason="within_effective_window",
     )
     hotspot = HotspotSnapshot(
         symbol="600519",
@@ -147,6 +149,27 @@ def test_two_closed_bars_are_required_for_risk_gate() -> None:
     assert second.status is TopDownScoreStatus.ELIGIBLE_FOR_RISK
 
 
+def test_confirmation_does_not_cross_scoring_or_pool_versions() -> None:
+    scoring = TopDownScoring()
+    first = scoring.evaluate(_context())
+    old_score = first.model_copy(update={"scoring_version": "1.0.0"})
+    changed_pool = first.model_copy(update={"pool_version": "another-pool"})
+
+    after_old_score = scoring.evaluate(_context(
+        bar_closed_at=NEXT,
+        previous_snapshot=old_score,
+    ))
+    after_changed_pool = scoring.evaluate(_context(
+        bar_closed_at=NEXT,
+        previous_snapshot=changed_pool,
+    ))
+
+    assert after_old_score.consecutive_pass_count == 1
+    assert after_old_score.status is TopDownScoreStatus.WAIT_CONFIRMATION
+    assert after_changed_pool.consecutive_pass_count == 1
+    assert after_changed_pool.status is TopDownScoreStatus.WAIT_CONFIRMATION
+
+
 def test_same_bar_or_non_adjacent_score_does_not_increment_confirmation() -> None:
     scoring = TopDownScoring()
     first = scoring.evaluate(_context())
@@ -181,6 +204,16 @@ def test_missing_required_index_fails_closed_without_zero_score() -> None:
     assert "missing_index_399006" in result.data_gaps
 
 
+def test_missing_data_revokes_an_open_authorization_without_inventing_score() -> None:
+    result = TopDownScoring().evaluate(
+        _context(indexes=_indexes()[:-1], authorization_open=True)
+    )
+
+    assert result.status is TopDownScoreStatus.AUTHORIZATION_REVOKED
+    assert result.total_score is None
+    assert "missing_index_399006" in result.data_gaps
+
+
 def test_index_hard_gate_cannot_be_offset_by_other_components() -> None:
     result = TopDownScoring().evaluate(_context(indexes=_indexes(bearish=True)))
     assert result.total_score is not None
@@ -193,6 +226,21 @@ def test_verified_official_negative_event_is_a_hard_block() -> None:
     result = TopDownScoring().evaluate(_context(theme=_theme(major_negative=True)))
     assert any(value.startswith("major_negative_") for value in result.hard_blocks)
     assert result.status is TopDownScoreStatus.BLOCKED
+
+
+def test_hotspot_time_data_gap_makes_entire_score_incomplete() -> None:
+    theme = _theme()
+    theme = theme.model_copy(update={
+        "hotspot": theme.hotspot.model_copy(update={
+            "data_gaps": ["major_negative_time_unverified:regulatory_investigation"]
+        })
+    })
+
+    result = TopDownScoring().evaluate(_context(theme=theme))
+
+    assert result.status is TopDownScoreStatus.DATA_INCOMPLETE
+    assert result.total_score is None
+    assert "major_negative_time_unverified:regulatory_investigation" in result.data_gaps
 
 
 def test_open_authorization_is_revoked_below_65() -> None:

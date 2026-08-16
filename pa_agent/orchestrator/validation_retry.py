@@ -36,25 +36,7 @@ def append_assistant_turn(
     if messages and messages[-1].get("role") == "assistant":
         if (messages[-1].get("content") or "").strip() == content.strip():
             return messages
-    preserve_mimo = False
-    if provider_settings is not None:
-        from pa_agent.ai.mimo_compat import (
-            build_assistant_api_message,
-            is_mimo_provider,
-        )
-
-        preserve_mimo = is_mimo_provider(
-            getattr(provider_settings, "base_url", ""),
-            getattr(provider_settings, "model", ""),
-        )
-    if preserve_mimo:
-        reasoning = getattr(reply, "reasoning_content", None) or ""
-        assistant_msg = build_assistant_api_message(
-            content,
-            reasoning_content=reasoning,
-        )
-    else:
-        assistant_msg = {"role": "assistant", "content": content}
+    assistant_msg = {"role": "assistant", "content": content}
     return messages + [assistant_msg]
 
 
@@ -175,25 +157,7 @@ def validate_with_retry(
             frame=validate_kwargs.get("kline_frame"),
             previous_raw=previous_raw,
         )
-        preserve_mimo = False
-        if provider_settings is not None:
-            from pa_agent.ai.mimo_compat import (
-                build_assistant_api_message,
-                is_mimo_provider,
-            )
-
-            preserve_mimo = is_mimo_provider(
-                getattr(provider_settings, "base_url", ""),
-                getattr(provider_settings, "model", ""),
-            )
-        if preserve_mimo:
-            reasoning = getattr(current_reply, "reasoning_content", None) or ""
-            assistant_msg = build_assistant_api_message(
-                content,
-                reasoning_content=reasoning,
-            )
-        else:
-            assistant_msg = {"role": "assistant", "content": content}
+        assistant_msg = {"role": "assistant", "content": content}
         current_messages = current_messages + [
             assistant_msg,
             {"role": "user", "content": feedback},

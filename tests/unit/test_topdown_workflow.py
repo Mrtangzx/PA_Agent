@@ -7,6 +7,7 @@ from pa_agent.trading.quant import SignalDecision, SignalStatus, StrategyContext
 from pa_agent.trading.quant_workflow import QuantTradingWorkflow
 from pa_agent.trading.store import TradeStore
 from pa_agent.trading.topdown import (
+    MANUAL_EXCEPTION_STRATEGY_ID,
     TOPDOWN_STRATEGY_ID,
     TopDownScoreSnapshot,
     TopDownScoreStatus,
@@ -110,3 +111,42 @@ def test_topdown_workflow_does_not_duplicate_score_persistence(tmp_path) -> None
     workflow.evaluate_topdown(_context(), _score(TopDownScoreStatus.ELIGIBLE_FOR_RISK))
 
     assert store.list_topdown_scores(symbol="600519") == []
+
+
+def test_manual_exception_plan_keeps_separate_strategy_and_half_risk_metadata(
+    tmp_path,
+) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    workflow = QuantTradingWorkflow(store, _AlwaysAllow())
+    manual_pool = "manual-exception-cloud_ai_11_v1-2026-08-2026-08-12-600519"
+    daily = _AlwaysAllow().evaluate(_context()).model_copy(update={
+        "strategy_id": MANUAL_EXCEPTION_STRATEGY_ID,
+        "pool_version": manual_pool,
+        "condition_snapshot": {
+            "manual_exception": True,
+            "daily_baseline_strategy": "cloud_ai_daily_pullback_v1",
+            "base_pool_version": "cloud_ai_11_v1-2026-08",
+            "expected_security_name": "贵州茅台",
+            "industry": "白酒",
+            "risk_multiplier": 0.5,
+            "max_concurrent_positions": 1,
+        },
+    })
+    score = _score(TopDownScoreStatus.ELIGIBLE_FOR_RISK).model_copy(update={
+        "pool_version": manual_pool,
+    })
+
+    first = workflow.create_topdown_plan(daily, score)
+    second = workflow.create_topdown_plan(daily, score)
+
+    assert first["plan_id"] == second["plan_id"]
+    plan = store.get_plan(first["plan_id"])
+    assert plan["strategy_version"] == MANUAL_EXCEPTION_STRATEGY_ID
+    assert plan["risk_snapshot"]["source"] == "deterministic_manual_exception_4321"
+    assert plan["risk_snapshot"]["base_pool_version"] == "cloud_ai_11_v1-2026-08"
+    assert plan["risk_snapshot"]["expected_security_name"] == "贵州茅台"
+    assert plan["risk_snapshot"]["industry"] == "白酒"
+    assert plan["risk_snapshot"]["risk_multiplier"] == 0.5
+    assert plan["risk_snapshot"]["max_concurrent_positions"] == 1
+    decision = store.get_decision(plan["decision_event_id"])
+    assert decision["final_decision"]["strategy_id"] == MANUAL_EXCEPTION_STRATEGY_ID

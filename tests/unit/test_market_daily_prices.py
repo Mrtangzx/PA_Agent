@@ -71,3 +71,26 @@ def test_market_daily_price_dates_returns_distinct_latest_dates(tmp_path) -> Non
         "2026-08-03",
         "2026-08-02",
     ]
+
+
+def test_market_daily_history_helpers_track_explicit_session_coverage(tmp_path) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    rows = [
+        {"as_of": day, "symbol": symbol, "price": price}
+        for day, price in (("2026-08-01", 10), ("2026-08-02", 11))
+        for symbol in ("600519", "000858")
+    ]
+    assert store.upsert_market_daily_price_rows(rows, captured_at="2026-08-03") == 4
+    assert store.market_daily_price_coverage(
+        session_dates=["2026-08-01", "2026-08-02"]
+    ) == {"2026-08-01": 2, "2026-08-02": 2}
+    assert store.complete_market_history_symbols(
+        {"600519", "000858", "000001"},
+        session_dates=["2026-08-01", "2026-08-02"],
+    ) == {"600519", "000858"}
+    assert store.market_daily_history_for_symbols(
+        {"600519", "000858"}, before_as_of="2026-08-03", limit_sessions=2
+    ) == {
+        "000858": [10.0, 11.0],
+        "600519": [10.0, 11.0],
+    }

@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
 from pa_agent.trading.market_sentiment import MarketSentimentService
+from pa_agent.trading.store import TradeStore
+from pa_agent.trading.universe import OfficialConstituent, OfficialConstituentFile
 
 NOW = datetime(2026, 8, 13, 10, 0, tzinfo=timezone(timedelta(hours=8)))
 
@@ -86,3 +88,135 @@ def test_market_sentiment_derives_worsening_flags_from_previous_frozen_inputs() 
     assert second.input.retreat_or_panic_bars == 2
     assert second.input.limit_down_and_blast_worsening
     assert second.input.systemic_volume_selloff
+
+
+def test_store_capture_uses_dedicated_hs300_breadth_not_external_pool_value(
+    tmp_path, monkeypatch
+) -> None:
+    from pa_agent.trading.store import TradeStore
+
+    calls = []
+    service = MarketSentimentService(
+        universe_loader=_universe,
+        limit_pool_loader=_pool,
+        now_provider=lambda: NOW + timedelta(seconds=20),
+        hs300_breadth_loader=lambda at: (
+            calls.append(at) or 61.5,
+            {"member_count": 300, "valid_member_count": 300},
+        ),
+    )
+    monkeypatch.setattr(
+        service, "turnover_vs_ma20",
+        lambda **_: (1.1, {"broad_index_positive": True}),
+    )
+    store = TradeStore(tmp_path / "trades.db")
+    # Seed 20 distinct closed-market baselines so new-high/new-low inputs exist.
+    for index in range(20):
+        store.update_market_daily_prices_and_high_low(
+            _universe(), as_of=f"2026-07-{index + 1:02d}", captured_at=NOW.isoformat()
+        )
+
+    result = service.capture_for_store(store=store, captured_at=NOW)
+
+    assert len(calls) == 1
+    assert result.input is not None
+    assert result.input.hs300_above_ma20_pct == 61.5
+    assert result.source_details["hs300_breadth"]["member_count"] == 300
+    assert result.observed_at == (NOW + timedelta(seconds=20)).isoformat()
+    assert result.source_details["capture_delay_seconds"] == 20
+
+
+def test_store_breadth_uses_19_closed_sessions_and_one_live_snapshot(tmp_path) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    members = [f"{index:06d}" for index in range(300)]
+    for day in range(1, 20):
+        store.upsert_market_daily_price_rows(
+            [
+                {"as_of": f"2026-07-{day:02d}", "symbol": symbol, "price": 10.0}
+                for symbol in members
+            ],
+            captured_at=NOW.isoformat(),
+        )
+    official = OfficialConstituentFile(
+        source_as_of=NOW.date(),
+        source_url="https://www.csindex.com.cn/fixture.xls",
+        source_hash="a" * 64,
+        constituents=[
+            OfficialConstituent(symbol=symbol, name=symbol) for symbol in members
+        ],
+    )
+    service = MarketSentimentService(
+        universe_loader=lambda: [
+            {"code": symbol, "price": 11.0, "pct_chg": 1, "amount": 1_000_000}
+            for symbol in members
+        ],
+        limit_pool_loader=_pool,
+        hs300_member_loader=lambda: official,
+    )
+
+    breadth, details = service._hs300_breadth_from_store(
+        store=store,
+        market_rows=service.universe_loader(),
+        captured_at=NOW,
+    )
+
+    assert breadth == 100
+    assert details["valid_member_count"] == 300
+    assert details["history_sessions_required"] == 19
+
+
+def test_store_breadth_batch_fills_members_missing_from_all_a_page(tmp_path) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    members = [f"{index:06d}" for index in range(300)]
+    for day in range(1, 20):
+        store.upsert_market_daily_price_rows(
+            [{"as_of": f"2026-07-{day:02d}", "symbol": symbol, "price": 10.0}
+             for symbol in members],
+            captured_at=NOW.isoformat(),
+        )
+    official = OfficialConstituentFile(
+        source_as_of=NOW.date(), source_url="fixture", source_hash="b" * 64,
+        constituents=[OfficialConstituent(symbol=s, name=s) for s in members],
+    )
+    missing = members[-36:]
+    service = MarketSentimentService(
+        hs300_member_loader=lambda: official,
+        hs300_spot_loader=lambda symbols: [
+            {"code": symbol, "price": 11.0} for symbol in symbols
+        ],
+    )
+    market_rows = [
+        {"code": symbol, "price": 11.0} for symbol in members if symbol not in missing
+    ]
+
+    breadth, details = service._hs300_breadth_from_store(
+        store=store, market_rows=market_rows, captured_at=NOW
+    )
+
+    assert breadth == 100
+    assert details["valid_member_count"] == 300
+    assert details["spot_fallback_requested"] == 36
+    assert details["spot_fallback_resolved"] == 36
+
+
+def test_sentiment_capture_over_five_minutes_fails_closed(tmp_path, monkeypatch) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    service = MarketSentimentService(
+        universe_loader=_universe,
+        limit_pool_loader=_pool,
+        hs300_breadth_loader=lambda _at: (61.5, {"valid_member_count": 300}),
+        now_provider=lambda: NOW + timedelta(minutes=5, seconds=1),
+    )
+    monkeypatch.setattr(
+        service, "turnover_vs_ma20", lambda **_: (1.1, {"broad_index_positive": True})
+    )
+    for index in range(20):
+        store.update_market_daily_prices_and_high_low(
+            _universe(), as_of=f"2026-07-{index + 1:02d}", captured_at=NOW.isoformat()
+        )
+
+    result = service.capture_for_store(store=store, captured_at=NOW)
+
+    assert not result.data_complete
+    assert result.input is None
+    assert "sentiment_capture_delay_exceeded_300s" in result.data_gaps

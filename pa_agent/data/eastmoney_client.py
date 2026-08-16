@@ -45,6 +45,8 @@ _UT = "fa5fd1943c7b386f172d6893dbfba10b"
 _WBP2U = "|0|0|0|web"
 _REFERER_CLIST = "https://quote.eastmoney.com/center/gridlist.html"
 _REFERER_KLINE = "https://quote.eastmoney.com/"
+_SEARCH_API_URL = "https://searchapi.eastmoney.com/api/suggest/get"
+_SEARCH_API_TOKEN = "D43BF722C8E33BDC906FB84D85E326E8"
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
@@ -144,7 +146,9 @@ def stock_market_code(symbol: str) -> int:
     # East Money's quote/K-line API currently routes Beijing A shares through
     # market id 0 as well. Keep this explicit so 8/43/92 codes are not treated
     # as Shanghai by a broad numeric-prefix rule.
-    return 1 if symbol[:1] in ("6", "9") else 0
+    code = str(symbol).strip()[-6:]
+    shanghai_a_prefixes = ("600", "601", "603", "605", "688", "689")
+    return 1 if code.startswith(shanghai_a_prefixes) else 0
 
 
 def stock_secid(symbol: str) -> str:
@@ -572,6 +576,7 @@ def fetch_stock_universe_page(
     page: int = 1,
     page_size: int = 100,
     sort_field: str = "f3",
+    sort_desc: bool = True,
 ) -> tuple[list[dict[str, Any]], int | None]:
     """Fetch one page of A-share spot rows from East Money ``/api/qt/clist/get``.
 
@@ -584,7 +589,7 @@ def fetch_stock_universe_page(
     params = {
         "pn": str(page),
         "pz": str(page_size),
-        "po": "1",
+        "po": "1" if sort_desc else "0",
         "np": "1",
         "dect": "1",
         "ut": _UT,
@@ -956,3 +961,166 @@ def fetch_stock_listing_profile(symbol: str) -> dict[str, Any] | None:
         "industry": str(payload.get("f127") or ""),
         "listing_date": str(payload.get("f189") or ""),
     }
+
+
+def fetch_stock_spot_rows(symbols: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+    """Fetch exact-symbol spot rows in batches via East Money ``ulist.np``.
+
+    The paginated all-A list can omit members while prices are changing. This
+    endpoint is used only to fill those explicit gaps, never to replace the
+    point-in-time universe definition.
+    """
+    codes = list(dict.fromkeys(
+        str(symbol)[-6:] for symbol in symbols
+        if str(symbol)[-6:].isdigit() and len(str(symbol)[-6:]) == 6
+    ))
+    rows: list[dict[str, Any]] = []
+    for offset in range(0, len(codes), 80):
+        chunk = codes[offset:offset + 80]
+        params = {
+            "fltt": "2",
+            "secids": ",".join(stock_secid(code) for code in chunk),
+            "fields": "f12,f14,f2,f3,f5,f6,f8,f10,f20,f21",
+            "ut": _UT,
+        }
+        try:
+            data = _get_json_on_hosts(
+                _QUOTE_HOSTS,
+                "/api/qt/ulist.np/get",
+                params,
+                timeout=12.0,
+                host_kind="quote",
+                referer=_REFERER_KLINE,
+                max_rounds=2,
+                max_hosts=2,
+            )
+        except EastMoneyTransientError as exc:
+            logger.debug("East Money batch spot rows failed: %s", exc)
+            continue
+        diff = (data.get("data") or {}).get("diff") or []
+        rows.extend(_parse_clist_rows(diff if isinstance(diff, list) else []))
+    return rows
+
+
+def _a_share_exchange(symbol: str) -> str:
+    code = str(symbol).strip()[-6:]
+    if code.startswith(("600", "601", "603", "605", "688", "689")):
+        return "SSE"
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return "SZSE"
+    return "BSE"
+
+
+def _stock_name_key(value: str) -> str:
+    return "".join(str(value or "").split()).casefold()
+
+
+def _fetch_stock_search_payload(query: str, *, count: int) -> dict[str, Any]:
+    params = {
+        "input": query,
+        "type": "14",
+        "token": _SEARCH_API_TOKEN,
+        "count": str(max(1, min(int(count), 50))),
+    }
+    last_exc: Exception | None = None
+    for attempt, impersonate in enumerate(_IMPERSONATE_OPTIONS):
+        try:
+            _throttle(backoff_s=0.25 * attempt)
+            return _http_get_once(
+                _SEARCH_API_URL,
+                params,
+                timeout=10.0,
+                impersonate=impersonate,
+                referer=_REFERER_CLIST,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if not _is_transient_http_error(exc):
+                raise
+    raise EastMoneyTransientError(str(last_exc or "东方财富股票名称搜索失败"))
+
+
+def search_a_share_stocks(query: str, *, count: int = 20) -> list[dict[str, str]]:
+    """Return only mainland A-share stock suggestions from East Money.
+
+    The public suggestion endpoint also returns Hong Kong shares, funds,
+    futures and indices for the same name.  Filtering by both East Money's
+    ``AStock`` classification and the production symbol validator prevents a
+    friendly name lookup from becoming a multi-market analysis bypass.
+    """
+    from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+    value = str(query or "").strip()
+    if not value:
+        return []
+    payload = _fetch_stock_search_payload(value, count=count)
+    table = payload.get("QuotationCodeTable") or {}
+    source_rows = table.get("Data") or []
+    if not isinstance(source_rows, list):
+        return []
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in source_rows:
+        if not isinstance(item, dict) or str(item.get("Classify") or "") != "AStock":
+            continue
+        symbol = str(item.get("Code") or item.get("UnifiedCode") or "").strip()
+        if symbol in seen or not is_a_share_stock_symbol(symbol):
+            continue
+        seen.add(symbol)
+        rows.append({
+            "symbol": symbol,
+            "name": str(item.get("Name") or symbol).strip(),
+            "exchange": _a_share_exchange(symbol),
+        })
+    return rows
+
+
+def resolve_a_share_stock_name(
+    name: str,
+    *,
+    preferred_members: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Resolve one stock name without consulting legacy multi-market aliases."""
+    from pa_agent.data.ashare_common import is_a_share_stock_symbol
+
+    value = str(name or "").strip()
+    if is_a_share_stock_symbol(value):
+        symbol = value[-6:]
+        return _a_share_exchange(symbol), symbol
+    key = _stock_name_key(value)
+    if not key:
+        raise ValueError("请输入A股股票代码或名称")
+
+    preferred: list[dict[str, str]] = []
+    for item in preferred_members or []:
+        symbol = str(item.get("symbol") or "").strip()
+        stock_name = str(item.get("name") or "").strip()
+        if is_a_share_stock_symbol(symbol) and stock_name:
+            preferred.append({
+                "symbol": symbol[-6:],
+                "name": stock_name,
+                "exchange": _a_share_exchange(symbol),
+            })
+    exact = [item for item in preferred if _stock_name_key(item["name"]) == key]
+    if len(exact) == 1:
+        return exact[0]["exchange"], exact[0]["symbol"]
+    partial = [
+        item for item in preferred
+        if key in _stock_name_key(item["name"])
+        or _stock_name_key(item["name"]) in key
+    ]
+    if len(partial) == 1:
+        return partial[0]["exchange"], partial[0]["symbol"]
+
+    rows = search_a_share_stocks(value)
+    exact = [item for item in rows if _stock_name_key(item["name"]) == key]
+    if len(exact) == 1:
+        return exact[0]["exchange"], exact[0]["symbol"]
+    if len(rows) == 1:
+        return rows[0]["exchange"], rows[0]["symbol"]
+    if not rows:
+        raise ValueError(f"未找到A股股票名称「{value}」，请改用6位A股代码")
+    choices = "、".join(
+        f"{item['name']}({item['symbol']})" for item in rows[:5]
+    )
+    raise ValueError(f"A股名称「{value}」存在多个候选：{choices}；请输入6位代码")

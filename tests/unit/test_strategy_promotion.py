@@ -5,8 +5,11 @@ from datetime import datetime, timedelta
 
 from pa_agent.trading.models import AssetClass, PlanStatus, TradePlan, TradeResult
 from pa_agent.trading.promotion import build_shadow_performance_evidence
+from pa_agent.trading.quant import StrategyState
+from pa_agent.trading.stability import PerformanceEvidence, StrategyStabilityController
 from pa_agent.trading.store import TradeStore
-from pa_agent.trading.topdown import TOPDOWN_STRATEGY_ID
+from pa_agent.trading.topdown import TOPDOWN_SCORING_VERSION, TOPDOWN_STRATEGY_ID
+from pa_agent.trading.universe import CLOUD_AI_UNIVERSE_ID
 
 
 def _add_shadow_result(
@@ -17,6 +20,7 @@ def _add_shadow_result(
     net_pnl: float | None,
     r_multiple: float,
     traced: bool = True,
+    scoring_version: str = TOPDOWN_SCORING_VERSION,
 ) -> None:
     decision_id = store.add_decision(
         symbol="600519",
@@ -27,6 +31,9 @@ def _add_shadow_result(
         meta={"strategy_version": TOPDOWN_STRATEGY_ID},
     )
     score = {
+        "strategy_version": TOPDOWN_STRATEGY_ID,
+        "scoring_version": scoring_version,
+        "pool_version": f"{CLOUD_AI_UNIVERSE_ID}-2026-08",
         "input_hash": uuid.uuid4().hex,
         "bar_closed_at": opened_at,
         "data_gaps": [],
@@ -65,6 +72,44 @@ def _add_shadow_result(
     ))
 
 
+def _enter_shadow(store: TradeStore) -> str:
+    evidence = PerformanceEvidence(
+        dataset="out_of_sample",
+        trade_count=200,
+        expectancy_r=0.15,
+        profit_factor=1.2,
+        max_drawdown_pct=9,
+        profitable_month_ratio=0.75,
+        point_in_time_universe_verified=True,
+        source_time_alignment_verified=True,
+        execution_rules_verified=True,
+        hotspot_sentiment_history_verified=True,
+    )
+    run_id = store.add_validation_run(
+        {
+            "strategy_version": TOPDOWN_STRATEGY_ID,
+            "status": "complete",
+            "input_hash": uuid.uuid4().hex,
+            "performance_evidence": evidence.model_dump(mode="json"),
+        },
+        dataset="out_of_sample",
+        promotion_eligible=True,
+    )
+    transition = StrategyStabilityController().evaluate(
+        StrategyState.CANDIDATE,
+        evidence,
+    )
+    store.record_strategy_transition(
+        transition,
+        evidence,
+        strategy_id=TOPDOWN_STRATEGY_ID,
+        validation_run_id=run_id,
+    )
+    return store.list_strategy_transitions(strategy_id=TOPDOWN_STRATEGY_ID)[0][
+        "created_at"
+    ]
+
+
 def test_shadow_evidence_is_derived_from_strategy_results_and_fails_closed(tmp_path) -> None:
     store = TradeStore(tmp_path / "trades.db")
     start = datetime.fromisoformat("2026-01-01T10:00:00+08:00")
@@ -77,48 +122,129 @@ def test_shadow_evidence_is_derived_from_strategy_results_and_fails_closed(tmp_p
         traced=False,
     )
 
-    evidence, gaps = build_shadow_performance_evidence(store)
+    evidence, gaps = build_shadow_performance_evidence(
+        store,
+        as_of=start + timedelta(days=91),
+    )
 
-    assert evidence.trade_count == 1
-    assert evidence.weeks == 13
+    assert evidence.trade_count == 0
+    assert evidence.weeks == 0
     assert not evidence.source_time_alignment_verified
     assert not evidence.execution_rules_verified
-    assert "shadow_net_pnl_or_fees_incomplete" in gaps
-    assert "shadow_topdown_source_trace_incomplete" in gaps
+    assert "shadow_state_not_entered" in gaps
+    assert "shadow_state_not_current:candidate" in gaps
+    assert "pre_shadow_results_excluded:1" in gaps
     assert "fixed_execution_mechanism_validation_incomplete" in gaps
 
 
 def test_shadow_evidence_uses_frozen_fixed_validation_and_complete_months(tmp_path) -> None:
     store = TradeStore(tmp_path / "trades.db")
+    shadow_started_at = datetime.fromisoformat(_enter_shadow(store))
     store.add_validation_run({
         "strategy_version": TOPDOWN_STRATEGY_ID,
         "status": "complete",
         "input_hash": "fixed",
         "checks": [{"name": "mechanics", "passed": True}],
     }, dataset="fixed_replay")
-    start = datetime.fromisoformat("2026-01-01T00:00:00+08:00")
+    start = shadow_started_at + timedelta(days=1)
     _add_shadow_result(
         store,
         opened_at=start.isoformat(),
-        closed_at="2026-02-15T15:00:00+08:00",
+        closed_at=(start + timedelta(days=31)).isoformat(),
         net_pnl=100,
         r_multiple=1,
     )
     _add_shadow_result(
         store,
-        opened_at="2026-02-15T15:00:00+08:00",
-        closed_at="2026-04-01T00:00:00+08:00",
+        opened_at=(start + timedelta(days=32)).isoformat(),
+        closed_at=(start + timedelta(days=109)).isoformat(),
         net_pnl=100,
         r_multiple=1,
     )
 
-    evidence, gaps = build_shadow_performance_evidence(store)
+    evidence, gaps = build_shadow_performance_evidence(
+        store,
+        as_of=start + timedelta(days=109),
+    )
 
     assert evidence.complete_months == 3
     assert not evidence.all_complete_months_profitable
     assert evidence.source_time_alignment_verified
     assert evidence.execution_rules_verified
     assert gaps == []
+
+
+def test_shadow_evidence_rejects_old_scoring_version(tmp_path) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    shadow_started_at = datetime.fromisoformat(_enter_shadow(store))
+    opened_at = shadow_started_at + timedelta(days=1)
+    closed_at = opened_at + timedelta(days=92)
+    opened = opened_at.isoformat()
+    closed = closed_at.isoformat()
+    _add_shadow_result(
+        store,
+        opened_at=opened,
+        closed_at=closed,
+        net_pnl=100,
+        r_multiple=1,
+        scoring_version="1.0.0",
+    )
+
+    evidence, gaps = build_shadow_performance_evidence(store, as_of=closed_at)
+
+    assert not evidence.source_time_alignment_verified
+    assert "shadow_topdown_version_trace_incomplete" in gaps
+
+
+def test_candidate_shadow_results_are_excluded_after_formal_shadow_entry(tmp_path) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    candidate_opened = datetime.now().astimezone() - timedelta(days=30)
+    _add_shadow_result(
+        store,
+        opened_at=candidate_opened.isoformat(),
+        closed_at=(candidate_opened + timedelta(days=1)).isoformat(),
+        net_pnl=100,
+        r_multiple=1,
+    )
+    shadow_started_at = datetime.fromisoformat(_enter_shadow(store))
+    formal_opened = shadow_started_at + timedelta(minutes=1)
+    _add_shadow_result(
+        store,
+        opened_at=formal_opened.isoformat(),
+        closed_at=(formal_opened + timedelta(days=1)).isoformat(),
+        net_pnl=100,
+        r_multiple=1,
+    )
+
+    evidence, gaps = build_shadow_performance_evidence(
+        store,
+        as_of=formal_opened + timedelta(days=2),
+    )
+
+    assert evidence.trade_count == 1
+    assert "pre_shadow_results_excluded:1" in gaps
+
+
+def test_one_long_trade_cannot_manufacture_twelve_observation_weeks(tmp_path) -> None:
+    store = TradeStore(tmp_path / "trades.db")
+    shadow_started_at = datetime.fromisoformat(_enter_shadow(store))
+    opened_at = shadow_started_at + timedelta(minutes=1)
+    _add_shadow_result(
+        store,
+        opened_at=opened_at.isoformat(),
+        closed_at=(opened_at + timedelta(days=91)).isoformat(),
+        net_pnl=100,
+        r_multiple=1,
+    )
+
+    evidence, gaps = build_shadow_performance_evidence(
+        store,
+        as_of=shadow_started_at + timedelta(days=7),
+    )
+
+    assert evidence.trade_count == 0
+    assert evidence.weeks == 1
+    assert "shadow_trade_timestamps_incomplete" in gaps
 
 
 def test_generated_oos_report_is_persisted_but_small_sample_cannot_promote(

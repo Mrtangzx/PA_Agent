@@ -8,6 +8,7 @@ import pytest
 
 from pa_agent.ai.codex_sdk_client import (
     CodexSdkClient,
+    _HiddenConsoleSubprocessProxy,
     _messages_to_prompt,
     _resolve_effort,
     _resolve_model,
@@ -141,3 +142,26 @@ def test_cancelled_before_codex_start() -> None:
     cancel = SimpleNamespace(is_set=lambda: True)
     with pytest.raises(CancelledError):
         CodexSdkClient(settings).stream_chat([], cancel_token=cancel)
+
+
+def test_hidden_console_proxy_preserves_existing_creation_flags() -> None:
+    calls: list[dict] = []
+
+    class _FakeSubprocess:
+        PIPE = object()
+
+        @staticmethod
+        def Popen(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return "process"
+
+    proxy = _HiddenConsoleSubprocessProxy(
+        _FakeSubprocess,
+        create_no_window_flag=0x08000000,
+    )
+
+    result = proxy.Popen(["codex.exe"], creationflags=0x00000200)
+
+    assert result == "process"
+    assert calls[0]["kwargs"]["creationflags"] == 0x08000200
+    assert proxy.PIPE is _FakeSubprocess.PIPE

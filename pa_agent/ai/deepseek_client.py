@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -18,6 +17,7 @@ from pa_agent.ai.mimo_compat import (
     response_message_dict,
     store_reasoning_from_response,
 )
+from pa_agent.ai.model_types import AIReply, AIUsage, CancelledError
 from pa_agent.config.settings import AIProviderSettings
 from pa_agent.util.mask_secret import mask_secret
 
@@ -32,46 +32,6 @@ else:
 logger = logging.getLogger(__name__)
 
 _MIMO_REASONING_CACHE = ReasoningCache()
-
-
-@dataclass
-class AIUsage:
-    """Token usage from a single API call."""
-    prompt_tokens: int = 0
-    cached_prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-
-    @property
-    def cache_hit_rate(self) -> float:
-        """Fraction of prompt tokens served from KV cache (0.0–1.0).
-
-        DeepSeek 硬盘缓存命中率。值越高，费用越低。
-        0.0 = 无缓存命中；1.0 = 全部命中缓存。
-        """
-        if self.prompt_tokens <= 0:
-            return 0.0
-        return self.cached_prompt_tokens / self.prompt_tokens
-
-    @property
-    def cache_miss_tokens(self) -> int:
-        """Prompt tokens that were NOT served from cache (billed at full rate)."""
-        return max(0, self.prompt_tokens - self.cached_prompt_tokens)
-
-
-@dataclass
-class AIReply:
-    """Structured response from a single AI API call."""
-    content: str
-    reasoning_content: str
-    raw: dict[str, Any]          # full raw response dict for debug tab
-    usage: AIUsage
-    request_id: str
-    latency_ms: float
-
-
-class CancelledError(Exception):
-    """Raised when a cancel_token is set before or during an API call."""
 
 
 def _is_deepseek_native(base_url: str) -> bool:

@@ -14,8 +14,8 @@ GOLD_TV_SYMBOL = "XAUUSD"
 GOLD_TV_EXCHANGE = "OANDA"
 
 # AkShare A-share defaults (平安银行 / 日线与 1h 分析常用)
-A_SHARE_DEFAULT_SYMBOL = "000001"
-A_SHARE_DEFAULT_TIMEFRAME = "1h"
+A_SHARE_DEFAULT_SYMBOL = "600519"
+A_SHARE_DEFAULT_TIMEFRAME = "15m"
 
 # Exchange → correct gold symbol on TradingView (do not use XAUUSD on TVC)
 TV_GOLD_SYMBOL_BY_EXCHANGE: dict[str, str] = {

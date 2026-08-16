@@ -1,7 +1,6 @@
 """Prompt assembler for Stage 1 (diagnosis) and Stage 2 (decision)."""
 from __future__ import annotations
 
-import datetime
 import functools
 import json
 import logging
@@ -81,12 +80,12 @@ _STAGE2_API_TASK_RULE = """
 **必须**：在 assistant 正文 `content` 输出**完整阶段二裸 JSON**（仅此一种交付物）。
 """.strip()
 
-_OPENCLAW_AGENT_NO_TOOLS_RULE = """
-## PA Agent × QClaw 任务模式（硬约束）
+_CODEX_SDK_NO_TOOLS_RULE = """
+## PA Agent × Codex SDK 任务模式（硬约束）
 
 你正在接收 **PA Agent 程序化 K 线分析**请求，不是通用编程/运维助手会话。
 
-**禁止调用任何工具**，包括但不限于：`exec`、运行 Python/shell、读/写/编辑文件、浏览器、联网搜索、在 `~/.qclaw/workspace` 写中间 `.md`/`.json` 等。
+**禁止调用任何工具**，包括但不限于：`exec`、运行 Python/shell、读/写/编辑文件、浏览器、联网搜索或写入中间文件。
 
 - K 线表、EMA/ATR、几何特征、阶段一诊断（若有）**已全部在用户消息中给出**；禁止再拉数据或读盘。
 - 风险点数、盈亏比、交易者方程、胜率估算等**一律在思考过程或 JSON 字段内心算**；禁止为 `risk=stop-entry` 之类简单算术启动解释器。
@@ -944,7 +943,7 @@ class PromptAssembler:
         system_parts = [
             _LANGUAGE_ZH_RULE,
             _PA_TERMINOLOGY_ZH,
-            _OPENCLAW_AGENT_NO_TOOLS_RULE,
+            _CODEX_SDK_NO_TOOLS_RULE,
             _THINKING_CONTENT_OUTPUT_RULE,
         ]
         system_parts.extend(self._load(name) for name in COMMON_SYSTEM_PROMPT_TXT_FILES)
@@ -1558,16 +1557,16 @@ class PromptAssembler:
     ) -> list[dict]:
         """Build Stage 2 messages, optionally chaining after Stage 1 for KV cache.
 
-        Prefix-chain mode (DeepSeek native, default when safe):
+        Prefix-chain mode (legacy provider compatibility):
           [system, user(S1…), assistant(S1 JSON), user(S2 task only)]
 
-        Standalone mode (OpenClaw Agent and similar):
+        Standalone mode (Codex SDK production default):
           [system, user(S2 task + full K-line tables)]
         """
-        from pa_agent.ai.deepseek_client import supports_kv_prefix_chain
-
         if use_prefix_chain is None:
-            use_prefix_chain = supports_kv_prefix_chain(provider_settings)
+            # Codex SDK creates an ephemeral thread for each PA Agent call, so
+            # provider-specific KV prefix chaining is intentionally disabled.
+            use_prefix_chain = False
 
         chain_after_s1 = bool(use_prefix_chain and stage1_messages)
         stage2_user_content = self._build_stage2_user_prompt(

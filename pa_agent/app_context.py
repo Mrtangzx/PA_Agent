@@ -18,7 +18,7 @@ class AppContext:
     data_source: Any = None       # DataSource implementation
 
     # AI / orchestration layer
-    client: Any = None            # DeepSeekClient
+    client: Any = None            # CodexSdkClient
     assembler: Any = None         # PromptAssembler
     router: Any = None            # route_strategy_files callable
     validator: Any = None         # JsonValidator
@@ -39,10 +39,16 @@ class AppContext:
     universe_service: Any = None # User-defined fixed current trading universe
     daily_candidate_scanner: Any = None # Closed-daily deterministic pool scanner
     market_sentiment_service: Any = None # Structured full-market sentiment collector
+    market_history_service: Any = None # Resumable real full-market history backfill
+    oos_observation_recorder: Any = None # Append-only production OOS ledger
+    oos_market_observation_service: Any = None # Signal-independent OOS bars
     portfolio_risk: Any = None    # PortfolioRisk
     strategy_stability: Any = None # StrategyStabilityController
     strategy_promotion: Any = None # Evidence-derived promotion workflow
+    validation_epochs: Any = None # Pool-version-bound validation epoch registry
     broker_adapter: Any = None    # ThsBrokerAdapter
+    ths_watchlist_service: Any = None # TongHuaShun categories and strategy scan
+    stock_selection_service: Any = None # Deterministic A-share discovery scanner
     quant_runtime: Any = None     # Application-scoped QuantRuntimeCoordinator
 
     @classmethod
@@ -67,14 +73,6 @@ class AppContext:
 
         # ── Settings ──────────────────────────────────────────────────────────
         settings = load_settings(SETTINGS_JSON_PATH)
-        from pa_agent.ai.cursor_connector import sync_cursor_provider_on_load
-        from pa_agent.ai.qclaw_connector import sync_qclaw_agent_provider_on_load
-        from pa_agent.ai.workbuddy_connector import sync_workbuddy_provider_on_load
-
-        sync_qclaw_agent_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_workbuddy_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_cursor_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-
         # ── Logging (with API key masking) ────────────────────────────────────
         configure_logging(api_key=settings.provider.api_key)
 
@@ -150,21 +148,32 @@ class AppContext:
         from pa_agent.trading.daily_candidates import DailyCandidateScanner
         from pa_agent.trading.hotspots import HotspotService
         from pa_agent.trading.lifecycle import TradeLifecycleTracker
+        from pa_agent.trading.market_history import MarketHistoryBackfillService
         from pa_agent.trading.market_sentiment import MarketSentimentService
+        from pa_agent.trading.oos_observations import (
+            OosMarketObservationService,
+            OosObservationRecorder,
+        )
         from pa_agent.trading.portfolio import PortfolioRisk
         from pa_agent.trading.promotion import StrategyPromotionService
         from pa_agent.trading.quant import Hs300DailyPullbackStrategy
         from pa_agent.trading.quant_workflow import QuantTradingWorkflow
         from pa_agent.trading.service import TradingService
         from pa_agent.trading.stability import StrategyStabilityController
+        from pa_agent.trading.stock_selection import StockSelectionService
         from pa_agent.trading.store import TradeStore
         from pa_agent.trading.strategy_validation import run_fixed_mechanism_validation
         from pa_agent.trading.topdown import TopDownScoring
         from pa_agent.trading.topdown_market_data import TopDownMarketDataService
         from pa_agent.trading.trade_lifecycle import TradeLifecycle
-        from pa_agent.trading.universe import FixedCloudAiUniverseService
+        from pa_agent.trading.ths_watchlist import ThsWatchlistScanService
+        from pa_agent.trading.universe import ManagedAshareUniverseService
+        from pa_agent.trading.validation_epoch import ValidationEpochRegistry
 
         trade_store = TradeStore(TRADES_DB_PATH, legacy_dir=TRADE_RECORDS_DIR)
+        validation_epochs = ValidationEpochRegistry(trade_store)
+        if trade_store.available:
+            validation_epochs.current()
         if trade_store.available:
             try:
                 fixed_validation = run_fixed_mechanism_validation()
@@ -181,13 +190,28 @@ class AppContext:
         quant_workflow = QuantTradingWorkflow(trade_store, quant_strategy)
         topdown_scoring = TopDownScoring(settings.topdown_scoring)
         hotspot_service = HotspotService()
+        stock_selection_service = StockSelectionService(settings.stock_selection)
         topdown_market_data_service = TopDownMarketDataService(topdown_scoring)
-        universe_service = FixedCloudAiUniverseService()
+        universe_service = ManagedAshareUniverseService(
+            trade_store, validation_epochs=validation_epochs
+        )
         daily_candidate_scanner = DailyCandidateScanner(quant_strategy)
         market_sentiment_service = MarketSentimentService()
+        market_history_service = MarketHistoryBackfillService()
+        oos_observation_recorder = OosObservationRecorder(
+            trade_store, validation_epochs=validation_epochs
+        )
+        # Persist the post-freeze strategy definition immediately. Market bars
+        # remain timer-driven and are still forbidden before their real close.
+        oos_observation_recorder.record_strategy_definition()
+        oos_market_observation_service = OosMarketObservationService(
+            oos_observation_recorder
+        )
         portfolio_risk = PortfolioRisk(settings.risk, settings.portfolio_risk)
         strategy_stability = StrategyStabilityController()
-        strategy_promotion = StrategyPromotionService(trade_store)
+        strategy_promotion = StrategyPromotionService(
+            trade_store, validation_epochs=validation_epochs
+        )
         broker_adapter = ThsBrokerAdapter(settings.ths)
         broker_trade_lifecycle = TradeLifecycle(trade_lifecycle, broker_adapter)
         broker_state = broker_adapter.connect()
@@ -203,6 +227,17 @@ class AppContext:
                 app_logger.warning("启动时同花顺只读同步失败: %s", exc)
         if not trade_store.available:
             app_logger.error("交易数据库不可用（分析功能继续）: %s", trade_store.error)
+        ths_watchlist_service = None
+        watchlist_root = (
+            str(broker_state.detected_install_path or "").strip()
+            or str(settings.ths.install_path or "").strip()
+        )
+        if trade_store.available and watchlist_root:
+            ths_watchlist_service = ThsWatchlistScanService(
+                trade_store,
+                daily_candidate_scanner,
+                install_root=watchlist_root,
+            )
 
         ctx = cls(
             settings=settings,
@@ -228,10 +263,16 @@ class AppContext:
             universe_service=universe_service,
             daily_candidate_scanner=daily_candidate_scanner,
             market_sentiment_service=market_sentiment_service,
+            market_history_service=market_history_service,
+            oos_observation_recorder=oos_observation_recorder,
+            oos_market_observation_service=oos_market_observation_service,
             portfolio_risk=portfolio_risk,
             strategy_stability=strategy_stability,
             strategy_promotion=strategy_promotion,
+            validation_epochs=validation_epochs,
             broker_adapter=broker_adapter,
+            ths_watchlist_service=ths_watchlist_service,
+            stock_selection_service=stock_selection_service,
         )
         # The coordinator is application-scoped but is started by main() only
         # after QApplication and the visible main window exist.  Keeping it on

@@ -47,6 +47,11 @@ from pa_agent.trading.topdown import (
     TopDownScoringContext,
     TopDownScoringSettings,
 )
+from pa_agent.trading.universe import (
+    CLOUD_AI_AUTHORIZATION_SYMBOLS,
+    CLOUD_AI_SYMBOLS,
+    cloud_ai_universe_version,
+)
 
 OOS_BACKTEST_VERSION = "topdown_oos_portfolio_v1"
 INDEX_CODES = ("000300", "000001", "000852", "399006")
@@ -77,7 +82,7 @@ class OosBacktestSettings(BaseModel):
     sell_tax_rate: float = Field(default=0.0005, ge=0)
     slippage_rate: float = Field(default=0.0005, ge=0, le=0.05)
     board_lot: int = Field(default=100, ge=1)
-    pool_size: int = Field(default=30, ge=1, le=300)
+    pool_size: int = Field(default=len(CLOUD_AI_AUTHORIZATION_SYMBOLS), ge=1, le=300)
 
 
 class OosBacktestTrade(BaseModel):
@@ -112,6 +117,9 @@ class OosBacktestReport(BaseModel):
     strategy_version: str = TOPDOWN_STRATEGY_ID
     backtest_version: str = OOS_BACKTEST_VERSION
     dataset: str = "out_of_sample"
+    validation_epoch_id: str = ""
+    pool_version: str = ""
+    member_hash: str = ""
     status: str
     input_hash: str
     promotion_eligible: bool = False
@@ -137,6 +145,7 @@ class _HistoricalBar:
     instrument_type: str
     effective_at: datetime
     source_published_at: datetime
+    observed_at: datetime
     bar: KlineBar
     signal_bar: KlineBar
     adjustment_factor: float
@@ -226,8 +235,25 @@ class OosPortfolioBacktester:
         generated_at = datetime.now().astimezone().isoformat()
         validation = validate_oos_bundle(Path(bundle_path))
         empty_evidence = PerformanceEvidence(dataset="out_of_sample", trade_count=0)
+        if validation.strategy_version != TOPDOWN_STRATEGY_ID:
+            return OosBacktestReport(
+                validation_epoch_id=validation.validation_epoch_id,
+                pool_version=validation.pool_version,
+                member_hash=validation.member_hash,
+                status="data_incomplete",
+                input_hash=self._input_hash(validation.input_hash),
+                period_start=validation.period_start,
+                period_end=validation.period_end,
+                performance_evidence=empty_evidence.model_dump(mode="json"),
+                data_gaps=["oos_bundle_strategy_mismatch_current_target"],
+                warnings=self._warnings(),
+                generated_at=generated_at,
+            )
         if validation.status != "complete":
             return OosBacktestReport(
+                validation_epoch_id=validation.validation_epoch_id,
+                pool_version=validation.pool_version,
+                member_hash=validation.member_hash,
                 status="data_incomplete",
                 input_hash=self._input_hash(validation.input_hash),
                 period_start=validation.period_start,
@@ -244,6 +270,9 @@ class OosPortfolioBacktester:
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             gaps.append(f"oos_backtest_load_failed:{type(exc).__name__}:{exc}")
             return OosBacktestReport(
+                validation_epoch_id=validation.validation_epoch_id,
+                pool_version=validation.pool_version,
+                member_hash=validation.member_hash,
                 status="data_incomplete",
                 input_hash=self._input_hash(validation.input_hash),
                 period_start=validation.period_start,
@@ -295,6 +324,9 @@ class OosPortfolioBacktester:
         )
         gate_failures = _oos_gate_failures(evidence)
         return OosBacktestReport(
+            validation_epoch_id=data.manifest.validation_epoch_id,
+            pool_version=data.manifest.pool_version,
+            member_hash=data.manifest.member_hash,
             status="complete" if not gaps else "data_incomplete",
             input_hash=self._input_hash(validation.input_hash),
             promotion_eligible=promotion_eligible,
@@ -315,6 +347,88 @@ class OosPortfolioBacktester:
         )
 
     def _build_monthly_pools(
+        self, data: _BundleData, gaps: list[str]
+    ) -> dict[str, set[str]]:
+        if data.manifest.strategy_version == TOPDOWN_STRATEGY_ID:
+            return self._build_fixed_cloud_ai_pools(data, gaps)
+        return self._build_legacy_hs300_pools(data, gaps)
+
+    def _build_fixed_cloud_ai_pools(
+        self, data: _BundleData, gaps: list[str]
+    ) -> dict[str, set[str]]:
+        index_days = sorted({
+            item.effective_at.date()
+            for item in data.daily.get(("index", "000300"), [])
+        })
+        first_days: dict[str, Any] = {}
+        for day in index_days:
+            first_days.setdefault(day.strftime("%Y-%m"), day)
+        defined = set(data.manifest.symbols or CLOUD_AI_SYMBOLS)
+        required = set(
+            data.manifest.authorization_symbols or CLOUD_AI_AUTHORIZATION_SYMBOLS
+        )
+        pools: dict[str, set[str]] = {}
+        for month, first_day in first_days.items():
+            warmup = [
+                item for item in data.daily.get(("index", "000300"), [])
+                if item.effective_at.date() < first_day
+            ]
+            if len(warmup) < 65:
+                continue
+            point = datetime.combine(
+                first_day, datetime.min.time(), tzinfo=index_by_day_timezone(data)
+            )
+            membership = _latest_before(
+                data.constituents, point, key=lambda value: value.effective_at
+            )
+            if membership is None:
+                gaps.append(f"pool_cloud_ai_definition_missing:{month}")
+                continue
+            if membership.source_published_at > point:
+                gaps.append(f"pool_cloud_ai_source_from_future:{month}")
+                continue
+            if set(membership.symbols) != defined:
+                gaps.append(f"pool_cloud_ai_definition_mismatch:{month}")
+                continue
+            incomplete = []
+            eligible: set[str] = set()
+            for symbol in sorted(required):
+                history = [
+                    item for item in data.daily.get(("stock", symbol), [])
+                    if item.effective_at.date() < first_day
+                ][-20:]
+                if len(history) < 20 or any(item.amount is None for item in history):
+                    incomplete.append(symbol)
+                    continue
+                latest = history[-1]
+                if None in (
+                    latest.suspended, latest.limit_locked, latest.is_st,
+                    latest.delisting, latest.listed_days,
+                ):
+                    incomplete.append(symbol)
+                    continue
+                if (
+                    latest.is_st or latest.delisting or latest.suspended
+                    or latest.limit_locked or int(latest.listed_days or 0) < 120
+                ):
+                    continue
+                if not latest.industry:
+                    incomplete.append(symbol)
+                    continue
+                eligible.add(symbol)
+            if incomplete:
+                gaps.append(
+                    f"pool_cloud_ai_eligibility_history_incomplete:{month}:"
+                    + ",".join(incomplete)
+                )
+                continue
+            # Fixed means no liquidity ranking or substitution. Members that
+            # fail a contemporaneous tradability rule are excluded only for
+            # that monthly snapshot; another symbol is never substituted.
+            pools[month] = eligible
+        return pools
+
+    def _build_legacy_hs300_pools(
         self, data: _BundleData, gaps: list[str]
     ) -> dict[str, set[str]]:
         hs300_days = sorted({
@@ -432,7 +546,12 @@ class OosPortfolioBacktester:
                     bars=tuple(item.signal_bar for item in stock_history),
                     index_bars=tuple(item.signal_bar for item in market_history),
                     market_breadth_pct=breadth,
-                    pool_version=f"hs300-{month}",
+                    pool_version=(
+                        data.manifest.pool_version
+                        or cloud_ai_universe_version(day)
+                        if data.manifest.strategy_version == TOPDOWN_STRATEGY_ID
+                        else f"hs300-{month}"
+                    ),
                     signal_time=stock_history[-1].effective_at.isoformat(),
                     next_trading_time=next_daily.effective_at.isoformat(),
                     eligible=True,
@@ -464,6 +583,17 @@ class OosPortfolioBacktester:
                     None,
                 )
                 if next_bar is None:
+                    continue
+                available_at = [
+                    datetime.fromisoformat(value)
+                    for key, value in score.source_timestamps.items()
+                    if key != "bar" and value
+                ]
+                if any(value > next_bar.effective_at for value in available_at):
+                    gaps.append(
+                        "score_source_not_available_before_next_execution_bar:"
+                        f"{symbol}:{score.bar_closed_at}"
+                    )
                     continue
                 identity = (symbol, next_bar.effective_at)
                 if identity in seen_opportunity:
@@ -544,7 +674,9 @@ class OosPortfolioBacktester:
         theme = _theme_input(signal.symbol, hotspot_record[1], hotspot_record[0])
         stock = self._stock_input(data, signal, stock_row)
         source_timestamps = {
-            "index": min(datetime.fromisoformat(item.captured_at) for item in indexes).isoformat(),
+            # The score becomes available only when the last of the four
+            # required index observations has arrived.
+            "index": max(datetime.fromisoformat(item.captured_at) for item in indexes).isoformat(),
             "sentiment": sentiment.captured_at,
             "theme": theme.captured_at,
             "quote": stock.captured_at,
@@ -605,7 +737,7 @@ class OosPortfolioBacktester:
                 and volume_ma20 > 0
                 and volumes[-1] >= volume_ma20 * 1.5
             ),
-            captured_at=at.isoformat(),
+            captured_at=max(item.observed_at for item in minute[-21:]).isoformat(),
         )
 
     def _stock_input(
@@ -655,7 +787,7 @@ class OosPortfolioBacktester:
             quote_age_seconds=0,
             quote_deviation_pct=0,
             existing_position=False,
-            captured_at=current.effective_at.isoformat(),
+            captured_at=current.observed_at.isoformat(),
         )
 
     def _run_portfolio(
@@ -1061,7 +1193,7 @@ class OosPortfolioBacktester:
     def _warnings() -> list[str]:
         return [
             "样本外回测是策略验证证据; 不构成收益承诺。",
-            "热点/情绪/历史成分和行情缺一项即失败关闭, 不使用当前数据回填历史。",
+            "热点/情绪/冻结股票池定义和行情缺一项即失败关闭, 不使用当前数据回填历史。",
             "成交采用保守滑点、A股100股整手、T+1、停牌与涨跌停约束。",
         ]
 
@@ -1209,6 +1341,7 @@ def _load_bundle(path: Path, gaps: list[str]) -> _BundleData:
                 instrument_type=instrument_type,
                 effective_at=effective,
                 source_published_at=_time(str(record.get("source_published_at") or "")),
+                observed_at=_time(str(record.get("observed_at") or "")),
                 bar=KlineBar(
                     seq=1,
                     ts_open=effective.timestamp() * 1000,
@@ -1290,7 +1423,7 @@ def _sentiment_input(record: dict[str, Any], at: datetime) -> SentimentScoreInpu
         retreat_or_panic_bars=int(record.get("retreat_or_panic_bars") or 0),
         limit_down_and_blast_worsening=bool(record.get("limit_down_and_blast_worsening", False)),
         systemic_volume_selloff=bool(record.get("systemic_volume_selloff", False)),
-        captured_at=at.isoformat(),
+        captured_at=str(record.get("observed_at") or at.isoformat()),
     )
 
 
@@ -1317,10 +1450,12 @@ def _theme_input(symbol: str, record: dict[str, Any], at: datetime) -> ThemeScor
             major_negative=bool(item.get("major_negative", False)),
             related_themes=[str(value) for value in item.get("related_themes") or []],
             risk_code=str(item.get("risk_code") or ""),
+            time_valid=bool(item.get("time_valid", False)),
+            time_validation_reason=str(item.get("time_validation_reason") or ""),
         ))
     hotspot = HotspotSnapshot(
         symbol=symbol,
-        captured_at=at.isoformat(),
+        captured_at=str(record.get("observed_at") or record.get("captured_at") or at.isoformat()),
         frozen_at=at.isoformat(),
         industries=[str(value) for value in record.get("industries") or []],
         concepts=[str(value) for value in record.get("concepts") or []],
@@ -1328,6 +1463,12 @@ def _theme_input(symbol: str, record: dict[str, Any], at: datetime) -> ThemeScor
         board_strength=dict(record.get("board_strength") or {}),
         positive_score=float(record.get("positive_score") or 0),
         negative_blocks=[str(value) for value in record.get("negative_blocks") or []],
+        data_gaps=[str(value) for value in record.get("data_gaps") or []],
+        rule_version=str(record.get("rule_version") or ""),
+        effective_windows_days={
+            str(key): int(value)
+            for key, value in (record.get("effective_windows_days") or {}).items()
+        },
     ).with_source_hash()
     return ThemeScoreInput(
         **{key: metrics[key] for key in required},

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from pa_agent.ai.deepseek_client import AIUsage
+from pa_agent.ai.model_types import AIUsage
 
 logger = logging.getLogger(__name__)
 

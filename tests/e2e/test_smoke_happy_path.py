@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from pa_agent.app_context import AppContext
+from pa_agent.config.settings import Settings
 from tests.fixtures.kline_bars import make_newest_first_bars
 from tests.fixtures.validators import schema_test_validator
 from pa_agent.ai.router import route_strategy_files
@@ -47,6 +48,9 @@ def _make_ctx(tmp_path, stage2_response=None):
     pending_writer = MagicMock()
 
     ctx = AppContext()
+    ctx.settings = Settings()
+    ctx.settings.general.alert_on_order_opportunity = False
+    ctx.settings.general.decision_flow_auto_play = False
     ctx.client = mock_client
     ctx.assembler = mock_assembler
     ctx.router = route_strategy_files
@@ -69,8 +73,12 @@ def test_happy_path_shows_trading_decision(qtbot, tmp_path):
     qtbot.addWidget(window)
     window.show()
 
-    window._ctx.settings.general.analysis_bar_count = 5
-    window._last_frame_ready_bars = make_newest_first_bars(9, with_forming=True)
+    window._ctx.settings.general.analysis_bar_count = 20
+    window._last_frame_ready_bars = make_newest_first_bars(
+        75,
+        with_forming=True,
+        bullish_step=0.5,
+    )
 
     window._on_submit_analysis()
 
@@ -84,8 +92,10 @@ def test_happy_path_shows_trading_decision(qtbot, tmp_path):
 
     # DecisionPanel should show a trading decision (not 不下单)
     conclusion_text = window._decision_panel._conclusion_label.text()
+    completed_record = pending_writer.save_full.call_args[0][0]
     assert "不下单" not in conclusion_text, (
-        f"Expected a trading decision, got: {conclusion_text!r}"
+        "Expected a trading decision, got: "
+        f"{conclusion_text!r}; stage2={completed_record.stage2_decision!r}"
     )
     assert conclusion_text != "—", (
         "DecisionPanel still shows default '—', expected a decision"
